@@ -17,7 +17,7 @@ pub struct Event {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
     /// Event time as milliseconds since Unix epoch.
-    pub time_unix_ms: u128,
+    pub time_unix_ms: u64,
     /// Event payload. The kernel stores it but does not interpret it.
     pub data: Value,
 }

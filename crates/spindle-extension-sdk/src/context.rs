@@ -11,13 +11,13 @@ pub struct ContinuationContext {
     /// Unix socket path accepting continuation-backed requests.
     pub socket: String,
     /// Expiry time as milliseconds since Unix epoch.
-    pub expires_unix_ms: u128,
+    pub expires_unix_ms: u64,
 }
 
 impl ContinuationContext {
     /// Create a continuation context.
     #[must_use]
-    pub fn new(id: impl Into<String>, socket: impl Into<String>, expires_unix_ms: u128) -> Self {
+    pub fn new(id: impl Into<String>, socket: impl Into<String>, expires_unix_ms: u64) -> Self {
         Self {
             id: id.into(),
             socket: socket.into(),

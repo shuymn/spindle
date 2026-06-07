@@ -7,7 +7,6 @@ use std::{
     path::{Path, PathBuf},
     process,
     sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -58,7 +57,7 @@ pub struct RegisteredRuntimeTrust {
     /// SHA-256 hash of the entrypoint at registration time.
     pub entrypoint_sha256: String,
     /// Registration time in milliseconds since Unix epoch.
-    pub registered_at_unix_ms: u128,
+    pub registered_at_unix_ms: u64,
 }
 
 impl<'de> Deserialize<'de> for RegisteredExtension {
@@ -329,7 +328,7 @@ fn ensure_static_surface(manifest: &ExtensionManifest) -> Result<(), SpindleErro
 struct RuntimeTrustSnapshot {
     entrypoint_path: PathBuf,
     entrypoint_sha256: String,
-    registered_at_unix_ms: u128,
+    registered_at_unix_ms: u64,
 }
 
 impl RuntimeTrustSnapshot {
@@ -348,7 +347,7 @@ impl RuntimeTrustSnapshot {
         Ok(Some(Self {
             entrypoint_sha256: sha256_file(&entrypoint_path)?,
             entrypoint_path,
-            registered_at_unix_ms: SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
+            registered_at_unix_ms: crate::now_unix_ms()?,
         }))
     }
 

@@ -29,7 +29,7 @@ pub struct ContinuationGrant {
     /// Original action that received the continuation.
     pub action: String,
     /// Expiry time as milliseconds since Unix epoch.
-    pub expires_unix_ms: u128,
+    pub expires_unix_ms: u64,
 }
 
 impl ContinuationStore {
@@ -63,7 +63,17 @@ impl ContinuationStore {
         &self,
         request: ContinuationGrantRequest<'_>,
     ) -> Result<ContinuationContext, SpindleError> {
-        let expires_unix_ms = now_unix_ms()? + request.ttl.as_millis();
+        let expires_unix_ms = now_unix_ms()?
+            .checked_add(u64::try_from(request.ttl.as_millis()).map_err(|_error| {
+                SpindleError::InvalidField {
+                    field: "continuation.ttl",
+                    reason: "ttl exceeds u64 millisecond range",
+                }
+            })?)
+            .ok_or(SpindleError::InvalidField {
+                field: "continuation.expires_unix_ms",
+                reason: "expiry time overflowed",
+            })?;
         let id = uuid::Uuid::now_v7().to_string();
         let grant = ContinuationGrant {
             id: id.clone(),

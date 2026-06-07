@@ -278,10 +278,14 @@ pub enum SpindleError {
     Json(#[from] serde_json::Error),
 }
 
-pub(crate) fn now_unix_ms() -> Result<u128, SpindleError> {
-    Ok(std::time::SystemTime::now()
+pub(crate) fn now_unix_ms() -> Result<u64, SpindleError> {
+    let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
-        .as_millis())
+        .as_millis();
+    u64::try_from(millis).map_err(|_error| SpindleError::InvalidField {
+        field: "time_unix_ms",
+        reason: "system clock exceeds u64 millisecond range",
+    })
 }
 
 pub(crate) fn validate_name(field: &'static str, value: &str) -> Result<(), SpindleError> {

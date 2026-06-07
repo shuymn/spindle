@@ -288,6 +288,22 @@ mod tests {
     }
 
     #[test]
+    fn host_request_round_trips_continuation_context() -> Result<(), ExtensionSdkError> {
+        let request = HostRequest::Invoke {
+            invocation: ActionInvocation::new("test.schedule", serde_json::json!({}))
+                .with_continuation(Some(ContinuationContext::new(
+                    "cont-1",
+                    "/tmp/spindle.sock",
+                    1_737_000_000_123,
+                ))),
+        };
+        let json = serde_json::to_string(&request)?;
+        let parsed: HostRequest = serde_json::from_str(&json)?;
+        assert_eq!(parsed, request);
+        Ok(())
+    }
+
+    #[test]
     fn action_output_serializes_emitted_events() -> Result<(), ExtensionSdkError> {
         let output = ActionOutput::event(
             ActionOutputEvent::new("aerospace.workspace.snapshot")
