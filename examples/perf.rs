@@ -170,7 +170,7 @@ fn measure_stdio_dispatch(root: &Path) -> Result<()> {
     fs::create_dir_all(&dir).context("create dispatch benchmark dir")?;
     let registry = ExtensionRegistry::in_dir(&dir);
     write_dispatch_registry(&registry, &dir)?;
-    let mut runtime = ExtensionRuntimeHost::new();
+    let runtime = ExtensionRuntimeHost::new();
     let args = json!({
         "active": "1",
         "occupied": ["1", "3", "8"],
@@ -178,7 +178,7 @@ fn measure_stdio_dispatch(root: &Path) -> Result<()> {
     });
 
     let cold_elapsed = measure(|| {
-        let mut dispatcher = Dispatcher::new(&registry, &mut runtime);
+        let dispatcher = Dispatcher::new(&registry, &runtime);
         let reports =
             dispatcher.dispatch_action("workspace-indicator.workspaces.render", &args, &[])?;
         black_box(reports.len());
@@ -188,7 +188,7 @@ fn measure_stdio_dispatch(root: &Path) -> Result<()> {
 
     let hot_elapsed = measure(|| {
         for _ in 0..STDIO_DISPATCH_ITERS {
-            let mut dispatcher = Dispatcher::new(&registry, &mut runtime);
+            let dispatcher = Dispatcher::new(&registry, &runtime);
             let reports =
                 dispatcher.dispatch_action("workspace-indicator.workspaces.render", &args, &[])?;
             black_box(reports.len());
@@ -261,6 +261,7 @@ fn write_dispatch_registry(registry: &ExtensionRegistry, dir: &Path) -> Result<(
             entrypoint: Some(String::from("/usr/bin/true")),
             capabilities: vec![String::from("sketchybar.ui.write")],
             emits: Vec::new(),
+            produces: Vec::new(),
             actions: [(
                 String::from("sketchybar.message.send"),
                 ExtensionAction {
@@ -269,6 +270,7 @@ fn write_dispatch_registry(registry: &ExtensionRegistry, dir: &Path) -> Result<(
             )]
             .into(),
             routes: Vec::new(),
+            runtime_trust: None,
         },
         RegisteredExtension {
             id: String::from("workspace-indicator"),
@@ -277,7 +279,10 @@ fn write_dispatch_registry(registry: &ExtensionRegistry, dir: &Path) -> Result<(
             runtime: ExtensionRuntime::StdioJsonl,
             entrypoint: Some(workspace_entrypoint.to_string_lossy().into_owned()),
             capabilities: Vec::new(),
-            emits: vec![String::from("sketchybar.message.requested")],
+            emits: Vec::new(),
+            produces: vec![String::from(
+                "workspace-indicator.sketchybar.message.requested",
+            )],
             actions: BTreeMap::from([
                 (
                     String::from("workspace-indicator.status.render"),
@@ -293,6 +298,7 @@ fn write_dispatch_registry(registry: &ExtensionRegistry, dir: &Path) -> Result<(
                 ),
             ]),
             routes: Vec::<ExtensionRoute>::new(),
+            runtime_trust: None,
         },
     ];
     fs::write(registry.path(), serde_json::to_vec_pretty(&entries)?)
@@ -301,29 +307,12 @@ fn write_dispatch_registry(registry: &ExtensionRegistry, dir: &Path) -> Result<(
 }
 
 fn workspace_indicator_entrypoint() -> Result<PathBuf> {
-    if let Some(path) = env::var_os(WORKSPACE_INDICATOR_BIN_ENV) {
-        return Ok(PathBuf::from(path));
-    }
-
-    let current_exe = env::current_exe().context("resolve current benchmark binary")?;
-    profile_sibling_binary(&current_exe, "spindle-workspace-indicator")
-        .with_context(|| format!("resolve {WORKSPACE_INDICATOR_BIN_ENV} fallback"))
-}
-
-fn profile_sibling_binary(current_exe: &Path, binary_name: &str) -> Result<PathBuf> {
-    for ancestor in current_exe.ancestors() {
-        if matches!(
-            ancestor.file_name().and_then(|name| name.to_str()),
-            Some("debug" | "release")
-        ) {
-            return Ok(ancestor.join(binary_name));
-        }
-    }
-
-    anyhow::bail!(
-        "could not find cargo profile directory for {}",
-        current_exe.display()
-    );
+    let path = env::var_os(WORKSPACE_INDICATOR_BIN_ENV).with_context(|| {
+        format!(
+            "{WORKSPACE_INDICATOR_BIN_ENV} is required for stdio dispatch benchmark. Build spindle-workspace-indicator first and pass its path via {WORKSPACE_INDICATOR_BIN_ENV}."
+        )
+    })?;
+    Ok(PathBuf::from(path))
 }
 
 fn measure(run: impl FnOnce() -> Result<()>) -> Result<Duration> {
@@ -353,25 +342,4 @@ fn temp_dir(prefix: &str) -> Result<PathBuf> {
     let path = env::temp_dir().join(format!("{prefix}-{}-{nanos}", process::id()));
     fs::create_dir_all(&path).context("create benchmark state dir")?;
     Ok(path)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn profile_sibling_binary_uses_current_profile_directory() -> Result<()> {
-        let debug_example = Path::new("/repo/target/debug/examples/perf");
-        let release_deps_example = Path::new("/repo/target/release/deps/perf-abc123");
-
-        assert_eq!(
-            profile_sibling_binary(debug_example, "spindle-workspace-indicator")?,
-            PathBuf::from("/repo/target/debug/spindle-workspace-indicator")
-        );
-        assert_eq!(
-            profile_sibling_binary(release_deps_example, "spindle-workspace-indicator")?,
-            PathBuf::from("/repo/target/release/spindle-workspace-indicator")
-        );
-        Ok(())
-    }
 }
