@@ -2,10 +2,67 @@ use std::{
     collections::VecDeque,
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, ErrorKind, Write},
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
 use crate::{Event, EventFilter, SpindleError, lock::SidecarLock};
+
+pub fn ensure_private_state_parent(path: &Path) -> Result<(), SpindleError> {
+    ensure_private_parent(path, "state_dir", "state directory must be private")
+}
+
+pub fn ensure_private_parent(
+    path: &Path,
+    field: &'static str,
+    reason: &'static str,
+) -> Result<(), SpindleError> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+
+    if parent.exists() {
+        return ensure_private_existing_dir(parent, field, reason);
+    }
+
+    create_private_dir_all(parent)?;
+    ensure_private_existing_dir(parent, field, reason)
+}
+
+fn create_private_dir_all(path: &Path) -> Result<(), SpindleError> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component);
+        if current.as_os_str().is_empty() || current.exists() {
+            continue;
+        }
+        match fs::DirBuilder::new().mode(0o700).create(&current) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn ensure_private_existing_dir(
+    path: &Path,
+    field: &'static str,
+    reason: &'static str,
+) -> Result<(), SpindleError> {
+    let metadata = fs::metadata(path)?;
+    if !metadata.is_dir() {
+        return Err(SpindleError::InvalidField {
+            field,
+            reason: "parent path must be a directory",
+        });
+    }
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(SpindleError::InvalidField { field, reason });
+    }
+    Ok(())
+}
 
 /// Append-only JSONL event log.
 #[derive(Debug, Clone)]
@@ -41,15 +98,15 @@ impl EventLog {
     /// Returns an error if the directory cannot be created, the log cannot be
     /// opened, or the event cannot be serialized.
     pub fn append(&self, event: &Event) -> Result<(), SpindleError> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        ensure_private_state_parent(&self.path)?;
 
         let _lock = SidecarLock::acquire(&self.path)?;
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
+            .mode(0o600)
             .open(&self.path)?;
+        fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600))?;
         serde_json::to_writer(&mut file, event)?;
         writeln!(file)?;
         file.flush()?;
@@ -135,7 +192,7 @@ impl TailEvents {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, sync::Arc, thread};
+    use std::{fs, os::unix::fs::PermissionsExt, sync::Arc, thread};
 
     use super::*;
 
@@ -158,6 +215,107 @@ mod tests {
         })?;
 
         assert_eq!(events, vec![second]);
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn event_log_file_is_created_private() -> Result<(), SpindleError> {
+        let dir = tests_support::test_dir()?;
+        let log = EventLog::in_dir(&dir);
+        let event =
+            Event::builder(String::from("agent.status.changed"), String::from("codex")).build()?;
+
+        log.append(&event)?;
+
+        assert_eq!(
+            fs::metadata(log.path())?.permissions().mode() & 0o777,
+            0o600
+        );
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn event_log_creates_new_state_dir_private() -> Result<(), SpindleError> {
+        let root = tests_support::test_dir()?;
+        let dir = root.join("nested").join("state");
+        let log = EventLog::in_dir(&dir);
+        let event =
+            Event::builder(String::from("agent.status.changed"), String::from("codex")).build()?;
+
+        log.append(&event)?;
+
+        assert_eq!(fs::metadata(&root)?.permissions().mode() & 0o777, 0o700);
+        assert_eq!(
+            fs::metadata(root.join("nested"))?.permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(fs::metadata(&dir)?.permissions().mode() & 0o777, 0o700);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn event_log_rejects_public_existing_state_dir() -> Result<(), SpindleError> {
+        let dir = tests_support::test_dir()?;
+        fs::create_dir_all(&dir)?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755))?;
+        let log = EventLog::in_dir(&dir);
+        let event =
+            Event::builder(String::from("agent.status.changed"), String::from("codex")).build()?;
+
+        let result = log.append(&event);
+
+        assert!(matches!(
+            result,
+            Err(SpindleError::InvalidField {
+                field: "state_dir",
+                ..
+            })
+        ));
+        assert_eq!(fs::metadata(&dir)?.permissions().mode() & 0o777, 0o755);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn event_log_rejects_parent_path_that_is_not_directory() -> Result<(), SpindleError> {
+        let dir = tests_support::test_dir()?;
+        let parent_file = dir.join("not-a-directory");
+        fs::write(&parent_file, b"not a directory")?;
+        let log = EventLog {
+            path: parent_file.join("events.jsonl"),
+        };
+        let event =
+            Event::builder(String::from("agent.status.changed"), String::from("codex")).build()?;
+
+        let result = log.append(&event);
+
+        assert!(matches!(
+            result,
+            Err(SpindleError::InvalidField {
+                field: "state_dir",
+                reason: "parent path must be a directory",
+            })
+        ));
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn event_log_does_not_chmod_existing_private_state_dir() -> Result<(), SpindleError> {
+        let dir = tests_support::test_dir()?;
+        fs::create_dir_all(&dir)?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+        let log = EventLog::in_dir(&dir);
+        let event =
+            Event::builder(String::from("agent.status.changed"), String::from("codex")).build()?;
+
+        log.append(&event)?;
+
+        assert_eq!(fs::metadata(&dir)?.permissions().mode() & 0o777, 0o700);
         fs::remove_dir_all(dir)?;
         Ok(())
     }
@@ -252,7 +410,11 @@ pub mod tests_support {
     pub fn test_dir() -> Result<PathBuf, SpindleError> {
         let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let counter = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
-        Ok(env::temp_dir().join(format!("spindle-test-{}-{suffix}-{counter}", process::id())))
+        let dir =
+            env::temp_dir().join(format!("spindle-test-{}-{suffix}-{counter}", process::id()));
+        fs::create_dir_all(&dir)?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+        Ok(dir)
     }
 
     pub fn write_executable(path: &std::path::Path, contents: &str) -> Result<(), SpindleError> {

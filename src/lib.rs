@@ -8,6 +8,9 @@
 #![warn(clippy::pedantic)]
 #![warn(clippy::nursery)]
 #![warn(clippy::cargo)]
+// Cargo-level lint only: current transitive graph contains duplicate versions
+// from upstream crates and uuid/getrandom target support outside this crate's control.
+#![allow(clippy::multiple_crate_versions)]
 
 pub mod cli;
 mod dispatch;
@@ -27,13 +30,13 @@ pub use dispatch::{DispatchReport, Dispatcher};
 pub use event::{ActionRequest, Event, EventBuilder, EventFilter};
 pub use extension::{
     ExtensionAction, ExtensionManifest, ExtensionRegistry, ExtensionRoute, ExtensionRuntime,
-    RegisteredExtension,
+    RegisteredExtension, RegisteredRuntimeTrust,
 };
 pub use handler::execute_request;
 pub use policy::CapabilityPolicy;
 pub use protocol::{HubRequest, HubResponse};
 pub use runtime::ExtensionRuntimeHost;
-pub use server::{send_request, serve};
+pub use server::{send_request, send_request_with_timeout, serve};
 pub use store::EventLog;
 use thiserror::Error;
 
@@ -91,6 +94,51 @@ pub enum SpindleError {
         grantor: String,
         /// Capability being granted.
         capability: String,
+    },
+
+    /// A direct client attempted to emit an unauthorized event.
+    #[error("source {event_source} is not allowed to emit event {kind}")]
+    EventEmitDenied {
+        /// Event source.
+        event_source: String,
+        /// Event kind.
+        kind: String,
+    },
+
+    /// An extension action produced an undeclared event kind.
+    #[error("extension {extension} action {action} produced undeclared event {kind}")]
+    UndeclaredProducedEvent {
+        /// Extension identifier.
+        extension: String,
+        /// Action name.
+        action: String,
+        /// Event kind.
+        kind: String,
+    },
+
+    /// A stdio extension requires trusted runtime execution to discover surface.
+    #[error(
+        "extension {extension} requires --trust-runtime to execute its entrypoint for registration"
+    )]
+    RuntimeTrustRequired {
+        /// Extension identifier.
+        extension: String,
+    },
+
+    /// A JSONL protocol message exceeded the configured byte limit.
+    #[error("protocol message exceeded {limit} bytes")]
+    MessageTooLarge {
+        /// Maximum accepted bytes.
+        limit: usize,
+    },
+
+    /// A trusted runtime entrypoint changed after registration.
+    #[error("extension {extension} trusted entrypoint changed: {}", entrypoint.display())]
+    ExtensionTrustChanged {
+        /// Extension identifier.
+        extension: String,
+        /// Trusted entrypoint path.
+        entrypoint: PathBuf,
     },
 
     /// The user's home directory could not be resolved.
@@ -220,7 +268,49 @@ pub enum SpindleError {
     Json(#[from] serde_json::Error),
 }
 
-pub(crate) fn validate_token(field: &'static str, value: &str) -> Result<(), SpindleError> {
+pub(crate) fn validate_name(field: &'static str, value: &str) -> Result<(), SpindleError> {
+    validate_non_empty_text(field, value)?;
+
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return Err(SpindleError::InvalidField {
+            field,
+            reason: "must not be empty",
+        });
+    };
+    if !first.is_ascii_alphanumeric() {
+        return Err(SpindleError::InvalidField {
+            field,
+            reason: "must start with an ASCII letter or number",
+        });
+    }
+    if chars.any(|ch| !matches!(ch, 'A'..='Z' | 'a'..='z' | '0'..='9' | '.' | '_' | ':' | '-')) {
+        return Err(SpindleError::InvalidField {
+            field,
+            reason: "must contain only ASCII letters, numbers, '.', '_', ':', or '-'",
+        });
+    }
+
+    Ok(())
+}
+
+pub(crate) fn validate_subject(field: &'static str, value: &str) -> Result<(), SpindleError> {
+    validate_non_empty_text(field, value)
+}
+
+pub(crate) fn validate_path_string(field: &'static str, value: &str) -> Result<(), SpindleError> {
+    validate_non_empty_text(field, value)?;
+    if value.contains('\0') {
+        return Err(SpindleError::InvalidField {
+            field,
+            reason: "must not contain NUL bytes",
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_non_empty_text(field: &'static str, value: &str) -> Result<(), SpindleError> {
     if value.trim().is_empty() {
         return Err(SpindleError::InvalidField {
             field,
@@ -236,4 +326,18 @@ pub(crate) fn validate_token(field: &'static str, value: &str) -> Result<(), Spi
     }
 
     Ok(())
+}
+
+pub(crate) fn validate_json_object(
+    field: &'static str,
+    value: &serde_json::Value,
+) -> Result<(), SpindleError> {
+    if value.is_object() {
+        return Ok(());
+    }
+
+    Err(SpindleError::InvalidField {
+        field,
+        reason: "must be a JSON object",
+    })
 }

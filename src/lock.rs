@@ -2,17 +2,19 @@ use std::{
     ffi::OsString,
     fs::{self, File},
     io::{Error, ErrorKind, Write},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::{self, Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use crate::SpindleError;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+const MALFORMED_STALE_AFTER: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 pub struct SidecarLock {
@@ -52,15 +54,13 @@ impl SidecarLock {
                     });
                 }
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                    if remove_dead_owner_lock(&lock_path)? {
+                    let timed_out = started.elapsed() >= timeout;
+                    let lock = read_lock(&lock_path)?;
+                    if remove_recoverable_lock(&lock_path, &lock)? {
                         continue;
                     }
-                    if started.elapsed() >= timeout {
-                        return Err(Error::new(
-                            ErrorKind::TimedOut,
-                            "timed out waiting for sidecar lock",
-                        )
-                        .into());
+                    if timed_out {
+                        return Err(lock_timeout_error(&lock_path, &lock).into());
                     }
                     thread::sleep(POLL_INTERVAL);
                 }
@@ -84,26 +84,76 @@ struct LockOwner {
     token: String,
 }
 
-fn remove_dead_owner_lock(lock_path: &Path) -> Result<bool, SpindleError> {
-    let Some(owner) = read_lock_owner(lock_path)? else {
-        return Ok(false);
-    };
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LockFileIdentity {
+    dev: u64,
+    ino: u64,
+}
 
-    if process_is_alive(owner.pid) {
-        return Ok(false);
+impl LockFileIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        }
     }
+}
 
+#[derive(Debug)]
+enum LockRead {
+    Missing,
+    Owner {
+        owner: LockOwner,
+        identity: LockFileIdentity,
+    },
+    Malformed {
+        modified: Option<SystemTime>,
+        identity: LockFileIdentity,
+    },
+}
+
+fn remove_recoverable_lock(lock_path: &Path, lock: &LockRead) -> Result<bool, SpindleError> {
+    match lock {
+        LockRead::Missing => Ok(true),
+        LockRead::Owner { owner, identity } if !process_is_alive(owner.pid) => {
+            remove_lock_file(lock_path, *identity)
+        }
+        LockRead::Malformed { modified, identity } if malformed_lock_is_stale(*modified) => {
+            remove_lock_file(lock_path, *identity)
+        }
+        LockRead::Owner { .. } | LockRead::Malformed { .. } => Ok(false),
+    }
+}
+
+fn remove_lock_file(
+    lock_path: &Path,
+    expected_identity: LockFileIdentity,
+) -> Result<bool, SpindleError> {
+    match fs::metadata(lock_path) {
+        Ok(metadata) if LockFileIdentity::from_metadata(&metadata) == expected_identity => {}
+        Ok(_) | Err(_) => return Ok(false),
+    }
     match fs::remove_file(lock_path) {
         Ok(()) => Ok(true),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(true),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error.into()),
     }
 }
 
-fn read_lock_owner(lock_path: &Path) -> Result<Option<LockOwner>, SpindleError> {
+fn read_lock(lock_path: &Path) -> Result<LockRead, SpindleError> {
+    let metadata = match fs::metadata(lock_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(LockRead::Missing),
+        Err(error) => return Err(error.into()),
+    };
+    let modified = metadata.modified().ok();
+    let identity = LockFileIdentity::from_metadata(&metadata);
     let contents = match fs::read_to_string(lock_path) {
         Ok(contents) => contents,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(LockRead::Missing),
+        Err(error) if error.kind() == ErrorKind::InvalidData => {
+            return Ok(LockRead::Malformed { modified, identity });
+        }
         Err(error) => return Err(error.into()),
     };
     let mut pid = None;
@@ -117,10 +167,45 @@ fn read_lock_owner(lock_path: &Path) -> Result<Option<LockOwner>, SpindleError> 
         }
     }
 
-    Ok(pid.map(|pid| LockOwner {
-        pid,
-        token: token.unwrap_or_default(),
-    }))
+    Ok(
+        pid.map_or(LockRead::Malformed { modified, identity }, |pid| {
+            LockRead::Owner {
+                owner: LockOwner {
+                    pid,
+                    token: token.unwrap_or_default(),
+                },
+                identity,
+            }
+        }),
+    )
+}
+
+fn read_lock_owner(lock_path: &Path) -> Result<Option<LockOwner>, SpindleError> {
+    match read_lock(lock_path)? {
+        LockRead::Owner { owner, .. } => Ok(Some(owner)),
+        LockRead::Missing | LockRead::Malformed { .. } => Ok(None),
+    }
+}
+
+fn malformed_lock_is_stale(modified: Option<SystemTime>) -> bool {
+    modified
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age >= MALFORMED_STALE_AFTER)
+}
+
+fn lock_timeout_error(lock_path: &Path, lock: &LockRead) -> Error {
+    let state = match lock {
+        LockRead::Missing => "missing",
+        LockRead::Owner { .. } => "owned",
+        LockRead::Malformed { .. } => "malformed",
+    };
+    Error::new(
+        ErrorKind::TimedOut,
+        format!(
+            "timed out waiting for sidecar lock {} ({state})",
+            lock_path.display()
+        ),
+    )
 }
 
 fn lock_token_matches(lock_path: &Path, token: &str) -> bool {
@@ -165,7 +250,7 @@ fn sidecar_lock_path(target_path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, time::Duration};
+    use std::{fs, thread, time::Duration};
 
     use super::*;
 
@@ -181,6 +266,75 @@ mod tests {
 
         let _lock = SidecarLock::acquire_with_timeout(&target, Duration::ZERO)?;
 
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_stale_lock_is_recovered() -> Result<(), SpindleError> {
+        let dir = crate::store::tests_support::test_dir()?;
+        fs::create_dir_all(&dir)?;
+        let target = dir.join("events.jsonl");
+        fs::write(dir.join("events.jsonl.lock"), "not a spindle lock\n")?;
+        thread::sleep(MALFORMED_STALE_AFTER + Duration::from_millis(50));
+
+        let _lock = SidecarLock::acquire_with_timeout(&target, Duration::ZERO)?;
+
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_stale_recovery_does_not_remove_replaced_lock() -> Result<(), SpindleError> {
+        let dir = crate::store::tests_support::test_dir()?;
+        fs::create_dir_all(&dir)?;
+        let lock_path = dir.join("events.jsonl.lock");
+        fs::write(&lock_path, "not a spindle lock\n")?;
+        thread::sleep(MALFORMED_STALE_AFTER + Duration::from_millis(50));
+        let stale_read = read_lock(&lock_path)?;
+        fs::remove_file(&lock_path)?;
+        fs::write(&lock_path, format!("pid={}\ntoken=fresh\n", process::id()))?;
+
+        assert!(!remove_recoverable_lock(&lock_path, &stale_read)?);
+        assert!(lock_path.exists());
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_fresh_lock_is_not_immediately_removed() -> Result<(), SpindleError> {
+        let dir = crate::store::tests_support::test_dir()?;
+        fs::create_dir_all(&dir)?;
+        let target = dir.join("events.jsonl");
+        let lock_path = dir.join("events.jsonl.lock");
+        fs::write(&lock_path, "not a spindle lock\n")?;
+
+        let result = SidecarLock::acquire_with_timeout(&target, Duration::from_millis(20));
+
+        assert!(result.is_err());
+        assert!(lock_path.exists());
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_lock_timeout_reports_parse_state() -> Result<(), SpindleError> {
+        let dir = crate::store::tests_support::test_dir()?;
+        fs::create_dir_all(&dir)?;
+        let target = dir.join("events.jsonl");
+        let lock_path = dir.join("events.jsonl.lock");
+        fs::write(&lock_path, "not a spindle lock\n")?;
+
+        let error = SidecarLock::acquire_with_timeout(&target, Duration::from_millis(20))
+            .err()
+            .ok_or(SpindleError::InvalidField {
+                field: "lock",
+                reason: "expected timeout",
+            })?;
+        let message = error.to_string();
+
+        assert!(message.contains("malformed"));
+        assert!(message.contains(&lock_path.display().to_string()));
         fs::remove_dir_all(dir)?;
         Ok(())
     }

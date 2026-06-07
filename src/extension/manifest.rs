@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use spindle_extension_sdk::{ExtensionRegistration, RegistrationAction, RegistrationRoute};
 
-use crate::{ExtensionRuntimeHost, SpindleError, validate_token};
+use crate::{
+    ExtensionRuntimeHost, SpindleError, validate_json_object, validate_name, validate_path_string,
+};
 
 /// Supported extension execution modes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,6 +39,9 @@ pub struct ExtensionAction {
 pub struct ExtensionRoute {
     /// Event type matched by this route.
     pub event: String,
+    /// Optional event source matched by this route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     /// Action to invoke when the event matches.
     pub action: String,
     /// Capabilities granted by this route.
@@ -59,6 +64,7 @@ impl From<RegistrationRoute> for ExtensionRoute {
     fn from(route: RegistrationRoute) -> Self {
         Self {
             event: route.event,
+            source: route.source,
             action: route.action,
             capabilities: route.capabilities,
             args: route.args,
@@ -83,6 +89,9 @@ pub struct ExtensionManifest {
     /// Event types this extension can emit.
     #[serde(default)]
     pub emits: Vec<String>,
+    /// Event types this extension's actions can produce.
+    #[serde(default)]
+    pub produces: Vec<String>,
     /// Capabilities declared by this extension.
     #[serde(default)]
     pub capabilities: Vec<String>,
@@ -117,7 +126,7 @@ impl ExtensionManifest {
     /// violates spindle's manifest rules, or registration fails.
     pub fn from_path_with_registration(
         path: &Path,
-        runtime: &mut ExtensionRuntimeHost,
+        runtime: &ExtensionRuntimeHost,
     ) -> Result<Self, SpindleError> {
         let mut manifest = Self::from_path(path)?;
         manifest.apply_runtime_registration(path, runtime)?;
@@ -132,25 +141,32 @@ impl ExtensionManifest {
     /// Returns an error when required fields are missing, names contain control
     /// characters, or an action requires an undeclared capability.
     pub fn validate(&self) -> Result<(), SpindleError> {
-        validate_token("id", &self.id)?;
-        validate_token("version", &self.version)?;
+        validate_name("id", &self.id)?;
+        validate_name("version", &self.version)?;
         self.validate_runtime_fields()?;
 
         for event in &self.emits {
-            validate_token("emits", event)?;
+            validate_name("emits", event)?;
         }
         validate_unique_values("emits", &self.emits)?;
 
+        for event in &self.produces {
+            validate_name("produces", event)?;
+        }
+        validate_unique_values("produces", &self.produces)?;
+        validate_disjoint_values(&self.emits, "produces", &self.produces)?;
+
         for capability in &self.capabilities {
-            validate_token("capability", capability)?;
+            validate_name("capability", capability)?;
         }
         validate_unique_values("capabilities", &self.capabilities)?;
 
         let declared = self.capabilities.iter().collect::<BTreeSet<_>>();
         for (action, definition) in &self.actions {
-            validate_token("action", action)?;
+            validate_name("action", action)?;
+            validate_unique_values("action.capabilities", &definition.capabilities)?;
             for capability in &definition.capabilities {
-                validate_token("capability", capability)?;
+                validate_name("capability", capability)?;
                 if !declared.contains(capability) {
                     return Err(SpindleError::UndeclaredCapability {
                         action: action.clone(),
@@ -161,10 +177,21 @@ impl ExtensionManifest {
         }
 
         for route in &self.routes {
-            validate_token("route.event", &route.event)?;
-            validate_token("route.action", &route.action)?;
+            validate_name("route.event", &route.event)?;
+            if let Some(source) = &route.source {
+                validate_name("route.source", source)?;
+            }
+            if !route.capabilities.is_empty() && route.source.is_none() {
+                return Err(SpindleError::InvalidField {
+                    field: "route.source",
+                    reason: "is required when route grants capabilities",
+                });
+            }
+            validate_json_object("route.args", &route.args)?;
+            validate_name("route.action", &route.action)?;
+            validate_unique_values("route.capabilities", &route.capabilities)?;
             for capability in &route.capabilities {
-                validate_token("route.capability", capability)?;
+                validate_name("route.capability", capability)?;
             }
         }
 
@@ -180,10 +207,10 @@ impl ExtensionManifest {
         }
     }
 
-    fn apply_runtime_registration(
+    pub(crate) fn apply_runtime_registration(
         &mut self,
         manifest_path: &Path,
-        runtime: &mut ExtensionRuntimeHost,
+        runtime: &ExtensionRuntimeHost,
     ) -> Result<(), SpindleError> {
         let Some(registration) = runtime.load_registration(self, manifest_path)? else {
             return Ok(());
@@ -196,16 +223,9 @@ impl ExtensionManifest {
         &mut self,
         registration: ExtensionRegistration,
     ) -> Result<(), SpindleError> {
-        for event in registration.emits {
-            if !self.emits.contains(&event) {
-                self.emits.push(event);
-            }
-        }
-        for capability in registration.capabilities {
-            if !self.capabilities.contains(&capability) {
-                self.capabilities.push(capability);
-            }
-        }
+        extend_unique(&mut self.emits, registration.emits);
+        extend_unique(&mut self.produces, registration.produces);
+        extend_unique(&mut self.capabilities, registration.capabilities);
         for (name, action) in registration.actions {
             let action = ExtensionAction::from(action);
             if let Some(existing) = self.actions.get(&name) {
@@ -229,9 +249,17 @@ impl ExtensionManifest {
     }
 }
 
+fn extend_unique(values: &mut Vec<String>, additions: impl IntoIterator<Item = String>) {
+    for value in additions {
+        if !values.contains(&value) {
+            values.push(value);
+        }
+    }
+}
+
 fn validate_optional_entrypoint(entrypoint: Option<&str>) -> Result<(), SpindleError> {
     if let Some(entrypoint) = entrypoint {
-        validate_token("entrypoint", entrypoint)?;
+        validate_path_string("entrypoint", entrypoint)?;
     }
     Ok(())
 }
@@ -243,7 +271,7 @@ fn validate_required_entrypoint(entrypoint: Option<&str>) -> Result<(), SpindleE
             reason: "is required unless runtime is recipe",
         });
     };
-    validate_token("entrypoint", entrypoint)
+    validate_path_string("entrypoint", entrypoint)
 }
 
 fn validate_unique_values(field: &'static str, values: &[String]) -> Result<(), SpindleError> {
@@ -253,6 +281,23 @@ fn validate_unique_values(field: &'static str, values: &[String]) -> Result<(), 
             return Err(SpindleError::InvalidField {
                 field,
                 reason: "must not contain duplicate values",
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_disjoint_values(
+    left: &[String],
+    right_field: &'static str,
+    right: &[String],
+) -> Result<(), SpindleError> {
+    let left = left.iter().collect::<BTreeSet<_>>();
+    for value in right {
+        if left.contains(value) {
+            return Err(SpindleError::InvalidField {
+                field: right_field,
+                reason: "must not overlap with emits",
             });
         }
     }

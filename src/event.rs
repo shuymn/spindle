@@ -1,13 +1,9 @@
-use std::{
-    process,
-    sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{SpindleError, validate_token};
+use crate::{SpindleError, validate_json_object, validate_name, validate_subject};
 
 /// Append-only event envelope used by spindle clients and extensions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,16 +68,17 @@ impl EventBuilder {
     /// Returns an error if required fields are empty, contain control
     /// characters, or the system clock cannot produce a Unix timestamp.
     pub fn build(self) -> Result<Event, SpindleError> {
-        validate_token("type", &self.kind)?;
-        validate_token("source", &self.source)?;
+        validate_name("type", &self.kind)?;
+        validate_name("source", &self.source)?;
         if let Some(subject) = &self.subject {
-            validate_token("subject", subject)?;
+            validate_subject("subject", subject)?;
         }
+        validate_json_object("data", &self.data)?;
 
         let time_unix_ms = now_unix_ms()?;
 
         Ok(Event {
-            id: uuid_v7_string(time_unix_ms),
+            id: uuid_v7_string(),
             kind: self.kind,
             source: self.source,
             subject: self.subject,
@@ -112,11 +109,12 @@ impl ActionRequest {
     /// Returns an error if the action name, requester, or capabilities are
     /// invalid, or if JSON serialization fails.
     pub fn into_event(self) -> Result<Event, SpindleError> {
-        validate_token("action", &self.action)?;
-        validate_token("requested_by", &self.requested_by)?;
+        validate_name("action", &self.action)?;
+        validate_name("requested_by", &self.requested_by)?;
         for capability in &self.capabilities {
-            validate_token("capability", capability)?;
+            validate_name("capability", capability)?;
         }
+        validate_json_object("args", &self.args)?;
 
         let data = serde_json::to_value(&self)?;
         Event::builder(String::from("action.requested"), self.requested_by)
@@ -149,30 +147,18 @@ impl EventFilter {
     }
 }
 
-static NEXT_EVENT_ID: AtomicU64 = AtomicU64::new(0);
-
 fn now_unix_ms() -> Result<u128, SpindleError> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())
 }
 
-fn uuid_v7_string(time_unix_ms: u128) -> String {
-    let timestamp = u64::try_from(time_unix_ms).unwrap_or(u64::MAX) & 0xffff_ffff_ffff;
-    let counter = NEXT_EVENT_ID.fetch_add(1, Ordering::Relaxed);
-    let entropy = counter ^ u64::from(process::id()).rotate_left(17) ^ timestamp.rotate_left(11);
-    let rand_a = u16::try_from((entropy >> 52) & 0x0fff).unwrap_or(0);
-    let rand_b = entropy & 0x3fff_ffff_ffff_ffff;
-
-    let group1 = u32::try_from(timestamp >> 16).unwrap_or(u32::MAX);
-    let group2 = u16::try_from(timestamp & 0xffff).unwrap_or(u16::MAX);
-    let group3 = 0x7000 | rand_a;
-    let group4 = 0x8000 | u16::try_from(rand_b >> 48).unwrap_or(0);
-    let group5 = rand_b & 0x0000_ffff_ffff_ffff;
-
-    format!("{group1:08x}-{group2:04x}-{group3:04x}-{group4:04x}-{group5:012x}")
+fn uuid_v7_string() -> String {
+    uuid::Uuid::now_v7().to_string()
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::BTreeSet, thread};
+
     use serde_json::json;
 
     use super::*;
@@ -193,9 +179,50 @@ mod tests {
         assert_eq!(&event.id[18..19], "-");
         assert_eq!(&event.id[23..24], "-");
         assert_eq!(&event.id[14..15], "7");
+        let parsed =
+            uuid::Uuid::parse_str(&event.id).map_err(|_source| SpindleError::InvalidField {
+                field: "id",
+                reason: "must parse as UUID",
+            })?;
+        assert_eq!(parsed.to_string(), event.id);
 
         let variant = &event.id[19..20];
         assert!(matches!(variant, "8" | "9" | "a" | "b"));
+        Ok(())
+    }
+
+    #[test]
+    fn event_builder_generates_unique_ids_across_threads() -> Result<(), SpindleError> {
+        let handles = (0..8)
+            .map(|_thread| {
+                thread::spawn(|| -> Result<Vec<String>, SpindleError> {
+                    let mut ids = Vec::new();
+                    for _ in 0..128 {
+                        ids.push(
+                            Event::builder(String::from("test.changed"), String::from("test"))
+                                .build()?
+                                .id,
+                        );
+                    }
+                    Ok(ids)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut ids = BTreeSet::new();
+        for handle in handles {
+            let thread_ids = handle
+                .join()
+                .map_err(|_payload| SpindleError::InvalidField {
+                    field: "thread",
+                    reason: "panicked",
+                })??;
+            for id in thread_ids {
+                ids.insert(id);
+            }
+        }
+
+        assert_eq!(ids.len(), 1024);
         Ok(())
     }
 

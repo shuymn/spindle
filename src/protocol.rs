@@ -1,9 +1,14 @@
-use std::path::PathBuf;
+use std::{
+    io::{self, BufRead, Read},
+    path::PathBuf,
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::SpindleError;
+
+pub const DEFAULT_JSONL_MESSAGE_LIMIT: usize = 1024 * 1024;
 
 /// JSONL request accepted by the spindle socket server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,6 +62,9 @@ pub enum HubRequest {
     RegisterExtension {
         /// Manifest path.
         manifest: PathBuf,
+        /// Execute the manifest entrypoint to collect dynamic surface.
+        #[serde(default)]
+        trust_runtime: bool,
     },
     /// List registered extensions.
     ListExtensions,
@@ -89,6 +97,93 @@ impl From<Result<Value, SpindleError>> for HubResponse {
     }
 }
 
+pub fn read_limited_jsonl_line(
+    reader: &mut impl BufRead,
+    limit: usize,
+) -> Result<Option<String>, SpindleError> {
+    let mut bytes = Vec::new();
+    let read = reader
+        .by_ref()
+        .take(u64::try_from(limit.saturating_add(1)).unwrap_or(u64::MAX))
+        .read_until(b'\n', &mut bytes)?;
+    if read == 0 {
+        return Ok(None);
+    }
+    if bytes.len() > limit {
+        return Err(SpindleError::MessageTooLarge { limit });
+    }
+    if !bytes.ends_with(b"\n") {
+        return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error).into())
+}
+
 fn empty_object() -> Value {
     Value::Object(serde_json::Map::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Cursor, ErrorKind};
+
+    use super::*;
+
+    #[test]
+    fn limited_line_reads_normal_framed_message() -> Result<(), SpindleError> {
+        let mut reader = Cursor::new(b"{}\nnext".as_slice());
+
+        let line = read_limited_jsonl_line(&mut reader, 8)?.ok_or(SpindleError::InvalidField {
+            field: "line",
+            reason: "missing",
+        })?;
+
+        assert_eq!(line, "{}\n");
+        Ok(())
+    }
+
+    #[test]
+    fn limited_line_rejects_newline_less_message_at_limit() {
+        let mut reader = Cursor::new(b"12345".as_slice());
+
+        let result = read_limited_jsonl_line(&mut reader, 5);
+
+        assert!(matches!(
+            result,
+            Err(SpindleError::Io(error)) if error.kind() == ErrorKind::UnexpectedEof
+        ));
+    }
+
+    #[test]
+    fn limited_line_rejects_oversized_message() {
+        let mut reader = Cursor::new(b"123456".as_slice());
+
+        let result = read_limited_jsonl_line(&mut reader, 5);
+
+        assert!(matches!(
+            result,
+            Err(SpindleError::MessageTooLarge { limit: 5 })
+        ));
+    }
+
+    #[test]
+    fn limited_line_rejects_non_utf8_input() {
+        let mut reader = Cursor::new([0xff, b'\n']);
+
+        let result = read_limited_jsonl_line(&mut reader, 8);
+
+        assert!(matches!(
+            result,
+            Err(SpindleError::Io(error)) if error.kind() == ErrorKind::InvalidData
+        ));
+    }
+
+    #[test]
+    fn limited_line_reports_empty_eof() -> Result<(), SpindleError> {
+        let mut reader = Cursor::new(Vec::<u8>::new());
+
+        assert!(read_limited_jsonl_line(&mut reader, 8)?.is_none());
+        Ok(())
+    }
 }
