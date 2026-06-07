@@ -9,9 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use spindle_extension_sdk::{ExtensionRegistration, RegistrationAction, RegistrationRoute};
 
-use crate::{
-    ExtensionRuntimeHost, SpindleError, validate_json_object, validate_name, validate_path_string,
-};
+use crate::{ExtensionRuntimeHost, SpindleError, validate_json_object, validate_name};
 
 /// Supported extension execution modes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,9 +78,6 @@ pub struct ExtensionManifest {
     pub id: String,
     /// Extension version string.
     pub version: String,
-    /// Executable or script path relative to the manifest file.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub entrypoint: Option<String>,
     /// Runtime used to launch the extension.
     #[serde(default)]
     pub runtime: ExtensionRuntime,
@@ -129,7 +124,8 @@ impl ExtensionManifest {
         runtime: &ExtensionRuntimeHost,
     ) -> Result<Self, SpindleError> {
         let mut manifest = Self::from_path(path)?;
-        manifest.apply_runtime_registration(path, runtime)?;
+        manifest
+            .apply_runtime_registration(path.parent().unwrap_or_else(|| Path::new(".")), runtime)?;
         manifest.validate()?;
         Ok(manifest)
     }
@@ -192,29 +188,21 @@ impl ExtensionManifest {
     }
 
     fn validate_runtime_fields(&self) -> Result<(), SpindleError> {
-        match self.runtime {
-            ExtensionRuntime::Recipe => {
-                validate_optional_entrypoint(self.entrypoint.as_deref())?;
-                if !self.actions.is_empty() {
-                    return Err(SpindleError::InvalidField {
-                        field: "actions",
-                        reason: "recipe extensions cannot declare actions",
-                    });
-                }
-            }
-            ExtensionRuntime::StdioJsonl => {
-                validate_required_entrypoint(self.entrypoint.as_deref())?;
-            }
+        if self.runtime == ExtensionRuntime::Recipe && !self.actions.is_empty() {
+            return Err(SpindleError::InvalidField {
+                field: "actions",
+                reason: "recipe extensions cannot declare actions",
+            });
         }
         Ok(())
     }
 
     pub(crate) fn apply_runtime_registration(
         &mut self,
-        manifest_path: &Path,
+        package_root: &Path,
         runtime: &ExtensionRuntimeHost,
     ) -> Result<(), SpindleError> {
-        let Some(registration) = runtime.load_registration(self, manifest_path)? else {
+        let Some(registration) = runtime.load_registration(self, package_root)? else {
             return Ok(());
         };
         self.merge_registration(registration)?;
@@ -257,23 +245,6 @@ fn extend_unique(values: &mut Vec<String>, additions: impl IntoIterator<Item = S
             values.push(value);
         }
     }
-}
-
-fn validate_optional_entrypoint(entrypoint: Option<&str>) -> Result<(), SpindleError> {
-    if let Some(entrypoint) = entrypoint {
-        validate_path_string("entrypoint", entrypoint)?;
-    }
-    Ok(())
-}
-
-fn validate_required_entrypoint(entrypoint: Option<&str>) -> Result<(), SpindleError> {
-    let Some(entrypoint) = entrypoint else {
-        return Err(SpindleError::InvalidField {
-            field: "entrypoint",
-            reason: "is required unless runtime is recipe",
-        });
-    };
-    validate_path_string("entrypoint", entrypoint)
 }
 
 fn validate_unique_values(field: &'static str, values: &[String]) -> Result<(), SpindleError> {

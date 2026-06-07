@@ -9,9 +9,18 @@ use super::*;
 fn registry_authorizes_installed_route_grants() -> Result<(), SpindleError> {
     let dir = crate::store::tests_support::test_dir()?;
     fs::create_dir_all(&dir)?;
-    let manifest_path = dir.join("extension.json");
+    let workflow = write_static_manifest_with_surface(
+        &dir,
+        "workflow",
+        StaticManifestSurface {
+            action_names: &[],
+            emits: &[],
+            produces: &[],
+            capabilities: &[],
+        },
+    )?;
     fs::write(
-        &manifest_path,
+        workflow.join("extension.json"),
         r#"{
           "id": "workflow",
           "version": "0.1.0",
@@ -26,26 +35,29 @@ fn registry_authorizes_installed_route_grants() -> Result<(), SpindleError> {
           ]
         }"#,
     )?;
-    let provider_host = dir.join("provider-host.sh");
-    crate::store::tests_support::write_executable(&provider_host, "#!/bin/sh\nexit 0\n")?;
-    let provider_manifest = dir.join("provider.json");
+    let provider = write_static_manifest_with_surface(
+        &dir,
+        "provider",
+        StaticManifestSurface {
+            action_names: &["provider.snapshot"],
+            emits: &["provider.changed"],
+            produces: &[],
+            capabilities: &[],
+        },
+    )?;
     fs::write(
-        &provider_manifest,
-        format!(
-            r#"{{
+        provider.join("extension.json"),
+        r#"{
           "id": "provider",
           "version": "0.1.0",
-          "entrypoint": "{}",
           "runtime": "stdio-jsonl",
           "emits": ["provider.changed"],
-          "actions": {{
-            "provider.snapshot": {{
+          "actions": {
+            "provider.snapshot": {
               "capabilities": []
-            }}
-          }}
-        }}"#,
-            provider_host.display()
-        ),
+            }
+          }
+        }"#,
     )?;
     crate::store::tests_support::write_capability_policy(
         &dir,
@@ -53,8 +65,8 @@ fn registry_authorizes_installed_route_grants() -> Result<(), SpindleError> {
     )?;
 
     let registry = ExtensionRegistry::in_dir(&dir);
-    registry.register_manifest(&provider_manifest)?;
-    let registered = registry.register_manifest(&manifest_path)?;
+    registry.install_manifest(&provider)?;
+    let registered = registry.install_manifest(&workflow)?;
     let policy = crate::CapabilityPolicy::load(&dir)?;
 
     policy.ensure_route_grants(&registered)?;
@@ -66,9 +78,18 @@ fn registry_authorizes_installed_route_grants() -> Result<(), SpindleError> {
 fn static_registration_rejects_ungranted_route_capabilities() -> Result<(), SpindleError> {
     let dir = crate::store::tests_support::test_dir()?;
     fs::create_dir_all(&dir)?;
-    let manifest_path = dir.join("extension.json");
+    let workflow = write_static_manifest_with_surface(
+        &dir,
+        "workflow",
+        StaticManifestSurface {
+            action_names: &[],
+            emits: &[],
+            produces: &[],
+            capabilities: &[],
+        },
+    )?;
     fs::write(
-        &manifest_path,
+        workflow.join("extension.json"),
         r#"{
           "id": "workflow",
           "version": "0.1.0",
@@ -84,7 +105,7 @@ fn static_registration_rejects_ungranted_route_capabilities() -> Result<(), Spin
         }"#,
     )?;
 
-    let result = ExtensionRegistry::in_dir(&dir).register_manifest(&manifest_path);
+    let result = ExtensionRegistry::in_dir(&dir).install_manifest(&workflow);
 
     assert!(matches!(
         result,
@@ -115,11 +136,10 @@ while IFS= read -r line; do
 done
 "#,
     )?;
-    let manifest = write_stdio_manifest(&dir, "route-host.json", "route-host", &host)?;
+    let package = write_stdio_package(&dir, "route-host", &host)?;
     let runtime = ExtensionRuntimeHost::new();
 
-    let result =
-        ExtensionRegistry::in_dir(&dir).register_manifest_trusting_runtime(&manifest, &runtime);
+    let result = ExtensionRegistry::in_dir(&dir).install_manifest_with_runtime(&package, &runtime);
 
     assert!(matches!(
         result,
@@ -134,7 +154,6 @@ fn recipe_manifest_can_contribute_routes_without_entrypoint() -> Result<(), Spin
     let manifest = ExtensionManifest {
         id: String::from("workspace-indicator"),
         version: String::from("0.1.0"),
-        entrypoint: None,
         runtime: ExtensionRuntime::Recipe,
         emits: Vec::new(),
         produces: Vec::new(),
@@ -157,8 +176,10 @@ fn recipe_manifest_can_contribute_routes_without_entrypoint() -> Result<(), Spin
 fn static_manifest_validation_does_not_execute_extension_host() -> Result<(), SpindleError> {
     let dir = crate::store::tests_support::test_dir()?;
     fs::create_dir_all(&dir)?;
-    let sentinel = dir.join("executed");
-    let host = dir.join("host.sh");
+    let package = dir.join("static-only");
+    fs::create_dir_all(package.join("bin"))?;
+    let sentinel = package.join("executed");
+    let host = package.join("bin/static-only");
     fs::write(
         &host,
         format!(
@@ -169,19 +190,16 @@ fn static_manifest_validation_does_not_execute_extension_host() -> Result<(), Sp
     let mut permissions = fs::metadata(&host)?.permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&host, permissions)?;
-
-    let manifest_path = dir.join("extension.json");
     fs::write(
-        &manifest_path,
+        package.join("extension.json"),
         serde_json::to_string_pretty(&serde_json::json!({
             "id": "static-only",
             "version": "0.1.0",
-            "entrypoint": host,
             "runtime": "stdio-jsonl"
         }))?,
     )?;
 
-    let manifest = ExtensionManifest::from_path(&manifest_path)?;
+    let manifest = ExtensionManifest::from_path(&package.join("extension.json"))?;
 
     assert_eq!(manifest.id, "static-only");
     assert!(!sentinel.exists());
@@ -193,14 +211,13 @@ fn static_manifest_validation_does_not_execute_extension_host() -> Result<(), Sp
 fn registry_replacement_invalidates_live_stdio_session() -> Result<(), SpindleError> {
     let dir = crate::store::tests_support::test_dir()?;
     fs::create_dir_all(&dir)?;
-    let first_host = write_marker_stdio_host(&dir, "first-host", "v1")?;
-    let second_host = write_marker_stdio_host(&dir, "second-host", "v2")?;
-    let first_manifest = write_stdio_manifest(&dir, "first.json", "replace-me", &first_host)?;
-    let second_manifest = write_stdio_manifest(&dir, "second.json", "replace-me", &second_host)?;
+    let first_host = write_marker_shell_host(&dir, "first-host", "v1")?;
+    let second_host = write_marker_shell_host(&dir, "second-host", "v2")?;
+    let first_package = write_stdio_package(&dir, "replace-me", &first_host)?;
     let registry = ExtensionRegistry::in_dir(&dir);
     let runtime = ExtensionRuntimeHost::new();
 
-    let first = registry.register_manifest_trusting_runtime(&first_manifest, &runtime)?;
+    let first = registry.install_manifest_with_runtime(&first_package, &runtime)?;
     first
         .actions
         .get("test.render")
@@ -213,7 +230,8 @@ fn registry_replacement_invalidates_live_stdio_session() -> Result<(), SpindleEr
         &ActionInvocation::new("test.render", serde_json::json!({})),
     )?;
 
-    let second = registry.register_manifest_trusting_runtime(&second_manifest, &runtime)?;
+    let second_package = write_stdio_package(&dir, "replace-me", &second_host)?;
+    let second = registry.install_manifest_with_runtime(&second_package, &runtime)?;
     second
         .actions
         .get("test.render")
@@ -244,17 +262,20 @@ fn trusted_runtime_registration_records_entrypoint_hash() -> Result<(), SpindleE
     let dir = crate::store::tests_support::test_dir()?;
     fs::create_dir_all(&dir)?;
     let host = write_marker_stdio_host(&dir, "trusted-host", "v1")?;
-    let manifest = write_stdio_manifest(&dir, "trusted.json", "trusted", &host)?;
+    let package = write_stdio_package(&dir, "trusted", &host)?;
     let runtime = ExtensionRuntimeHost::new();
 
     let registered =
-        ExtensionRegistry::in_dir(&dir).register_manifest_trusting_runtime(&manifest, &runtime)?;
+        ExtensionRegistry::in_dir(&dir).install_manifest_with_runtime(&package, &runtime)?;
     let trust = registered.runtime_trust.ok_or(SpindleError::InvalidField {
         field: "runtime_trust",
         reason: "missing",
     })?;
 
-    assert_eq!(trust.entrypoint_path, fs::canonicalize(&host)?);
+    assert_eq!(
+        trust.entrypoint_path,
+        fs::canonicalize(dir.join("extensions").join("trusted").join("bin/trusted"))?
+    );
     assert_eq!(trust.entrypoint_sha256.len(), 64);
     assert!(trust.registered_at_unix_ms > 0);
     fs::remove_dir_all(dir)?;
@@ -276,11 +297,10 @@ fn trusted_runtime_registration_rejects_entrypoint_mutation_during_registration(
         ..TestHostConfig::with_registration(registration)
     };
     let host = crate::store::tests_support::install_test_host(&dir, "mutating-host", &config)?;
-    let manifest = write_stdio_manifest(&dir, "mutating.json", "mutating", &host)?;
+    let package = write_stdio_package(&dir, "mutating", &host)?;
     let runtime = ExtensionRuntimeHost::new();
 
-    let result =
-        ExtensionRegistry::in_dir(&dir).register_manifest_trusting_runtime(&manifest, &runtime);
+    let result = ExtensionRegistry::in_dir(&dir).install_manifest_with_runtime(&package, &runtime);
 
     assert!(matches!(
         result,
@@ -315,14 +335,14 @@ fn sha256_file_hashes_large_file_without_reading_all_at_once() -> Result<(), Spi
 }
 
 #[test]
-fn static_registration_has_no_runtime_trust_metadata() -> Result<(), SpindleError> {
+fn static_registration_records_runtime_trust_metadata() -> Result<(), SpindleError> {
     let dir = crate::store::tests_support::test_dir()?;
     fs::create_dir_all(&dir)?;
-    let manifest = write_static_manifest(&dir, "static", &["static.action"], &[], &[])?;
+    let package = write_static_manifest(&dir, "static", &["static.action"], &[], &[])?;
 
-    let registered = ExtensionRegistry::in_dir(&dir).register_manifest(&manifest)?;
+    let registered = ExtensionRegistry::in_dir(&dir).install_manifest(&package)?;
 
-    assert!(registered.runtime_trust.is_none());
+    assert!(registered.runtime_trust.is_some());
     fs::remove_dir_all(dir)?;
     Ok(())
 }
@@ -332,12 +352,19 @@ fn changed_trusted_entrypoint_is_rejected_before_spawn() -> Result<(), SpindleEr
     let dir = crate::store::tests_support::test_dir()?;
     fs::create_dir_all(&dir)?;
     let host = write_marker_stdio_host(&dir, "trusted-host", "v1")?;
-    let manifest = write_stdio_manifest(&dir, "trusted.json", "trusted", &host)?;
+    let package = write_stdio_package(&dir, "trusted", &host)?;
     let runtime = ExtensionRuntimeHost::new();
     let registered =
-        ExtensionRegistry::in_dir(&dir).register_manifest_trusting_runtime(&manifest, &runtime)?;
+        ExtensionRegistry::in_dir(&dir).install_manifest_with_runtime(&package, &runtime)?;
     crate::store::tests_support::write_executable(
-        &host,
+        &registered
+            .runtime_trust
+            .as_ref()
+            .ok_or(SpindleError::InvalidField {
+                field: "runtime_trust",
+                reason: "missing",
+            })?
+            .entrypoint_path,
         r"#!/bin/sh
 exit 42
 ",
@@ -364,12 +391,21 @@ fn trusted_invoke_executes_canonical_entrypoint_not_retargeted_symlink() -> Resu
     fs::create_dir_all(&dir)?;
     let trusted_host = write_marker_shell_host(&dir, "trusted-real", "trusted")?;
     let malicious_host = write_marker_shell_host(&dir, "malicious", "malicious")?;
-    let entry_symlink = dir.join("entry.sh");
+    let package = dir.join("trusted");
+    fs::create_dir_all(package.join("bin"))?;
+    let entry_symlink = package.join("bin/trusted");
     symlink(&trusted_host, &entry_symlink)?;
-    let manifest = write_stdio_manifest(&dir, "trusted.json", "trusted", &entry_symlink)?;
+    fs::write(
+        package.join("extension.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "id": "trusted",
+            "version": "0.1.0",
+            "runtime": "stdio-jsonl"
+        }))?,
+    )?;
     let runtime = ExtensionRuntimeHost::new();
     let registered =
-        ExtensionRegistry::in_dir(&dir).register_manifest_trusting_runtime(&manifest, &runtime)?;
+        ExtensionRegistry::in_dir(&dir).install_manifest_with_runtime(&package, &runtime)?;
     fs::remove_file(&entry_symlink)?;
     symlink(&malicious_host, &entry_symlink)?;
 
@@ -389,7 +425,7 @@ fn trusted_invoke_executes_canonical_entrypoint_not_retargeted_symlink() -> Resu
 }
 
 #[test]
-fn trusted_registration_through_symlinked_manifest_uses_canonical_entrypoint()
+fn trusted_registration_through_symlinked_package_uses_canonical_entrypoint()
 -> Result<(), SpindleError> {
     let dir = crate::store::tests_support::test_dir()?;
     let real_dir = dir.join("real");
@@ -397,12 +433,11 @@ fn trusted_registration_through_symlinked_manifest_uses_canonical_entrypoint()
     fs::create_dir_all(&real_dir)?;
     symlink(&real_dir, &linked_dir)?;
     let host = write_marker_stdio_host(&real_dir, "trusted-host", "canonical")?;
-    write_stdio_manifest(&real_dir, "extension.json", "trusted", &host)?;
-    let linked_manifest = linked_dir.join("extension.json");
+    write_stdio_package(&real_dir, "trusted", &host)?;
     let runtime = ExtensionRuntimeHost::new();
 
     let registered = ExtensionRegistry::in_dir(&dir)
-        .register_manifest_trusting_runtime(&linked_manifest, &runtime)?;
+        .install_manifest_with_runtime(&linked_dir.join("trusted"), &runtime)?;
     let trust = registered
         .runtime_trust
         .as_ref()
@@ -411,7 +446,10 @@ fn trusted_registration_through_symlinked_manifest_uses_canonical_entrypoint()
             reason: "missing",
         })?;
 
-    assert_eq!(trust.entrypoint_path, fs::canonicalize(&host)?);
+    assert_eq!(
+        trust.entrypoint_path,
+        fs::canonicalize(dir.join("extensions/trusted/bin/trusted"))?
+    );
     let output = runtime.invoke_action(
         &registered,
         "test.render",
@@ -431,10 +469,9 @@ fn trusted_registration_through_symlinked_manifest_uses_canonical_entrypoint()
 fn runtime_respawns_stdio_session_when_registered_metadata_changes() -> Result<(), SpindleError> {
     let dir = crate::store::tests_support::test_dir()?;
     fs::create_dir_all(&dir)?;
-    let first_host = write_marker_stdio_host(&dir, "first-direct-host", "v1")?;
-    let second_host = write_marker_stdio_host(&dir, "second-direct-host", "v2")?;
-    let first = registered_stdio_extension(&dir, "replace-me", &first_host);
-    let second = registered_stdio_extension(&dir, "replace-me", &second_host);
+    let first_host = write_marker_shell_host(&dir, "first-direct-host", "v1")?;
+    let second_host = write_marker_shell_host(&dir, "second-direct-host", "v2")?;
+    let first = registered_stdio_extension(&dir, "replace-me", &first_host)?;
     let runtime = ExtensionRuntimeHost::new();
 
     let first_output = runtime.invoke_action(
@@ -442,6 +479,7 @@ fn runtime_respawns_stdio_session_when_registered_metadata_changes() -> Result<(
         "test.render",
         &ActionInvocation::new("test.render", serde_json::json!({})),
     )?;
+    let second = registered_stdio_extension(&dir, "replace-me", &second_host)?;
     let second_output = runtime.invoke_action(
         &second,
         "test.render",
@@ -457,6 +495,66 @@ fn runtime_respawns_stdio_session_when_registered_metadata_changes() -> Result<(
         serde_json::json!({ "marker": "v2" })
     );
     runtime.shutdown()?;
+    fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[test]
+fn bootstrap_install_order_does_not_require_provider_first() -> Result<(), SpindleError> {
+    let dir = crate::store::tests_support::test_dir()?;
+    fs::create_dir_all(&dir)?;
+    let clock = write_clock_bootstrap_package(&dir)?;
+    let sketchybar = write_sketchybar_bootstrap_package(&dir)?;
+    let registry = ExtensionRegistry::in_dir(&dir);
+
+    registry.install_manifest(&clock)?;
+    registry.install_manifest(&sketchybar)?;
+
+    assert_eq!(registry.list()?.len(), 2);
+    fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[test]
+fn incomplete_bootstrap_fails_installed_registry_validation() -> Result<(), SpindleError> {
+    let dir = crate::store::tests_support::test_dir()?;
+    fs::create_dir_all(&dir)?;
+    let clock = write_clock_bootstrap_package(&dir)?;
+    let registry = ExtensionRegistry::in_dir(&dir);
+    registry.install_manifest(&clock)?;
+
+    let result = validate_installed_registry(&registry);
+
+    let Err(SpindleError::RegistryValidationFailed { messages }) = result else {
+        return Err(SpindleError::InvalidField {
+            field: "validation",
+            reason: "expected registry validation to fail",
+        });
+    };
+    assert_eq!(messages.len(), 1);
+    assert!(messages[0].starts_with("clock:"));
+    assert!(messages[0].contains("sketchybar.message.send"));
+    fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[test]
+fn incomplete_bootstrap_blocks_daemon_startup() -> Result<(), SpindleError> {
+    let dir = crate::store::tests_support::test_dir()?;
+    fs::create_dir_all(&dir)?;
+    let clock = write_clock_bootstrap_package(&dir)?;
+    let registry = ExtensionRegistry::in_dir(&dir);
+    registry.install_manifest(&clock)?;
+
+    let socket = dir.join("spindle.sock");
+    let log = EventLog::in_dir(&dir);
+    let result = serve(&socket, &log);
+
+    assert!(matches!(
+        result,
+        Err(SpindleError::RegistryValidationFailed { .. })
+    ));
+    assert!(!socket.exists());
     fs::remove_dir_all(dir)?;
     Ok(())
 }

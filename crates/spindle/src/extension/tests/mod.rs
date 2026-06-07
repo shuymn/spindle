@@ -14,11 +14,12 @@ use spindle_extension_sdk::{
 use spindle_test_host::TestHostConfig;
 
 use super::*;
-use crate::{ExtensionRuntimeHost, SpindleError};
+use crate::{EventLog, ExtensionRuntimeHost, SpindleError, serve, validate_installed_registry};
 
 mod manifest;
 mod registry;
 mod runtime_trust;
+mod stage;
 mod surface;
 
 fn write_static_manifest(
@@ -53,6 +54,8 @@ fn write_static_manifest_with_surface(
     id: &str,
     surface: StaticManifestSurface<'_>,
 ) -> Result<PathBuf, SpindleError> {
+    let package = dir.join(id);
+    fs::create_dir_all(package.join("bin"))?;
     let actions = surface
         .action_names
         .iter()
@@ -65,18 +68,18 @@ fn write_static_manifest_with_surface(
             )
         })
         .collect::<BTreeMap<_, _>>();
-    let (runtime, entrypoint) = if surface.action_names.is_empty() {
-        (ExtensionRuntime::Recipe, None)
+    let runtime = if surface.action_names.is_empty() {
+        ExtensionRuntime::Recipe
     } else {
-        (
-            ExtensionRuntime::StdioJsonl,
-            Some(String::from("./bin/extension")),
-        )
+        crate::store::tests_support::write_executable(
+            &package.join("bin").join(id),
+            "#!/bin/sh\nexit 0\n",
+        )?;
+        ExtensionRuntime::StdioJsonl
     };
     let manifest = ExtensionManifest {
         id: String::from(id),
         version: String::from("0.1.0"),
-        entrypoint,
         runtime,
         emits: surface
             .emits
@@ -96,25 +99,81 @@ fn write_static_manifest_with_surface(
         actions,
         routes: Vec::new(),
     };
-    let path = dir.join(format!("{id}.json"));
-    fs::write(&path, serde_json::to_string_pretty(&manifest)?)?;
-    Ok(path)
+    fs::write(
+        package.join("extension.json"),
+        serde_json::to_string_pretty(&manifest)?,
+    )?;
+    Ok(package)
 }
 
-fn registered_stdio_extension(dir: &Path, id: &str, host: &Path) -> RegisteredExtension {
-    RegisteredExtension {
+fn write_clock_bootstrap_package(dir: &Path) -> Result<PathBuf, SpindleError> {
+    let package = dir.join("clock");
+    fs::create_dir_all(&package)?;
+    fs::write(
+        package.join("extension.json"),
+        r#"{
+          "id": "clock",
+          "version": "0.1.0",
+          "runtime": "recipe",
+          "emits": ["clock.tick"],
+          "routes": [
+            {
+              "event": "clock.tick",
+              "action": "sketchybar.message.send"
+            }
+          ]
+        }"#,
+    )?;
+    Ok(package)
+}
+
+fn write_sketchybar_bootstrap_package(dir: &Path) -> Result<PathBuf, SpindleError> {
+    write_static_manifest_with_surface(
+        dir,
+        "sketchybar",
+        StaticManifestSurface {
+            action_names: &["sketchybar.message.send"],
+            emits: &[],
+            produces: &[],
+            capabilities: &[],
+        },
+    )
+}
+
+fn registered_stdio_extension(
+    dir: &Path,
+    id: &str,
+    host: &Path,
+) -> Result<RegisteredExtension, SpindleError> {
+    let package = dir.join(id);
+    fs::create_dir_all(package.join("bin"))?;
+    let staged_host = package.join("bin").join(id);
+    fs::copy(host, &staged_host)?;
+    let host_config = host.with_extension("json");
+    if host_config.is_file() {
+        fs::copy(&host_config, staged_host.with_extension("json"))?;
+    }
+    let mut permissions = fs::metadata(&staged_host)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&staged_host, permissions)?;
+    let entrypoint_path = fs::canonicalize(&staged_host)?;
+    let entrypoint_sha256 = sha256_file(&entrypoint_path)?;
+    Ok(RegisteredExtension {
         id: String::from(id),
         version: String::from("0.1.0"),
-        manifest_path: dir.join("extension.json"),
+        package_root: package,
         runtime: ExtensionRuntime::StdioJsonl,
-        entrypoint: Some(host.to_string_lossy().into_owned()),
         capabilities: Vec::new(),
         emits: Vec::new(),
         produces: Vec::new(),
         actions: BTreeMap::new(),
         routes: Vec::new(),
-        runtime_trust: None,
-    }
+        runtime_trust: Some(RegisteredRuntimeTrust {
+            entrypoint_path,
+            entrypoint_sha256,
+            registered_at_unix_ms: 0,
+        }),
+    })
 }
 
 fn write_marker_stdio_host(dir: &Path, name: &str, marker: &str) -> Result<PathBuf, SpindleError> {
@@ -148,16 +207,21 @@ done
     Ok(host)
 }
 
-fn write_stdio_manifest(
-    dir: &Path,
-    file_name: &str,
-    id: &str,
-    host: &Path,
-) -> Result<PathBuf, SpindleError> {
+fn write_stdio_package(dir: &Path, id: &str, host: &Path) -> Result<PathBuf, SpindleError> {
+    let package = dir.join(id);
+    fs::create_dir_all(package.join("bin"))?;
+    let staged_host = package.join("bin").join(id);
+    fs::copy(host, &staged_host)?;
+    let host_config = host.with_extension("json");
+    if host_config.is_file() {
+        fs::copy(&host_config, staged_host.with_extension("json"))?;
+    }
+    let mut permissions = fs::metadata(&staged_host)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&staged_host, permissions)?;
     let manifest = ExtensionManifest {
         id: String::from(id),
         version: String::from("0.1.0"),
-        entrypoint: Some(host.to_string_lossy().into_owned()),
         runtime: ExtensionRuntime::StdioJsonl,
         emits: Vec::new(),
         produces: Vec::new(),
@@ -165,9 +229,11 @@ fn write_stdio_manifest(
         actions: BTreeMap::new(),
         routes: Vec::new(),
     };
-    let path = dir.join(file_name);
-    fs::write(&path, serde_json::to_string_pretty(&manifest)?)?;
-    Ok(path)
+    fs::write(
+        package.join("extension.json"),
+        serde_json::to_string_pretty(&manifest)?,
+    )?;
+    Ok(package)
 }
 
 fn assert_surface_conflict(

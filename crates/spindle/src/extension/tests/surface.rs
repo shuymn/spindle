@@ -8,9 +8,9 @@ fn registry_rejects_action_surface_conflicts() -> Result<(), SpindleError> {
     let second = write_static_manifest(&dir, "second", &["shared.action"], &[], &[])?;
     let registry = ExtensionRegistry::in_dir(&dir);
 
-    registry.register_manifest(&first)?;
+    registry.install_manifest(&first)?;
     let error = registry
-        .register_manifest(&second)
+        .install_manifest(&second)
         .err()
         .ok_or(SpindleError::InvalidField {
             field: "surface",
@@ -30,9 +30,9 @@ fn registry_rejects_event_surface_conflicts() -> Result<(), SpindleError> {
     let second = write_static_manifest(&dir, "second", &[], &["shared.changed"], &[])?;
     let registry = ExtensionRegistry::in_dir(&dir);
 
-    registry.register_manifest(&first)?;
+    registry.install_manifest(&first)?;
     let error = registry
-        .register_manifest(&second)
+        .install_manifest(&second)
         .err()
         .ok_or(SpindleError::InvalidField {
             field: "surface",
@@ -61,9 +61,9 @@ fn surface_conflict_detects_emit_produce_overlap() -> Result<(), SpindleError> {
     )?;
     let registry = ExtensionRegistry::in_dir(&dir);
 
-    registry.register_manifest(&first)?;
+    registry.install_manifest(&first)?;
     let error = registry
-        .register_manifest(&second)
+        .install_manifest(&second)
         .err()
         .ok_or(SpindleError::InvalidField {
             field: "surface",
@@ -101,9 +101,9 @@ fn surface_conflict_detects_produce_produce_overlap() -> Result<(), SpindleError
     )?;
     let registry = ExtensionRegistry::in_dir(&dir);
 
-    registry.register_manifest(&first)?;
+    registry.install_manifest(&first)?;
     let error = registry
-        .register_manifest(&second)
+        .install_manifest(&second)
         .err()
         .ok_or(SpindleError::InvalidField {
             field: "surface",
@@ -123,9 +123,9 @@ fn registry_rejects_capability_surface_conflicts() -> Result<(), SpindleError> {
     let second = write_static_manifest(&dir, "second", &[], &[], &["shared.write"])?;
     let registry = ExtensionRegistry::in_dir(&dir);
 
-    registry.register_manifest(&first)?;
+    registry.install_manifest(&first)?;
     let error = registry
-        .register_manifest(&second)
+        .install_manifest(&second)
         .err()
         .ok_or(SpindleError::InvalidField {
             field: "surface",
@@ -145,7 +145,6 @@ fn registry_allows_consumer_action_capabilities_from_provider() -> Result<(), Sp
     let provider = ExtensionManifest {
         id: String::from("aerospace"),
         version: String::from("0.1.0"),
-        entrypoint: None,
         runtime: ExtensionRuntime::Recipe,
         emits: Vec::new(),
         produces: Vec::new(),
@@ -167,7 +166,6 @@ fn registry_allows_consumer_action_capabilities_from_provider() -> Result<(), Sp
     let consumer = ExtensionManifest {
         id: String::from("workspace-indicator"),
         version: String::from("0.1.0"),
-        entrypoint: Some(String::from("./bin/extension")),
         runtime: ExtensionRuntime::StdioJsonl,
         emits: Vec::new(),
         produces: Vec::new(),
@@ -176,14 +174,26 @@ fn registry_allows_consumer_action_capabilities_from_provider() -> Result<(), Sp
         routes: Vec::new(),
     };
 
-    let provider_path = dir.join("aerospace.json");
-    let consumer_path = dir.join("workspace-indicator.json");
-    fs::write(&provider_path, serde_json::to_string_pretty(&provider)?)?;
-    fs::write(&consumer_path, serde_json::to_string_pretty(&consumer)?)?;
+    let provider_package = dir.join("aerospace");
+    let consumer_package = dir.join("workspace-indicator");
+    fs::create_dir_all(&provider_package)?;
+    fs::create_dir_all(consumer_package.join("bin"))?;
+    crate::store::tests_support::write_executable(
+        &consumer_package.join("bin/workspace-indicator"),
+        "#!/bin/sh\nexit 0\n",
+    )?;
+    fs::write(
+        provider_package.join("extension.json"),
+        serde_json::to_string_pretty(&provider)?,
+    )?;
+    fs::write(
+        consumer_package.join("extension.json"),
+        serde_json::to_string_pretty(&consumer)?,
+    )?;
 
     let registry = ExtensionRegistry::in_dir(&dir);
-    registry.register_manifest(&provider_path)?;
-    registry.register_manifest(&consumer_path)?;
+    registry.install_manifest(&provider_package)?;
+    registry.install_manifest(&consumer_package)?;
 
     let extensions = registry.list()?;
     assert_eq!(extensions.len(), 2);
@@ -216,7 +226,7 @@ fn registry_serializes_concurrent_installs() -> Result<(), SpindleError> {
     for manifest in manifests {
         let registry = Arc::clone(&registry);
         handles.push(thread::spawn(move || {
-            registry.register_manifest(&manifest).map(|_registered| ())
+            registry.install_manifest(&manifest).map(|_registered| ())
         }));
     }
 

@@ -15,6 +15,7 @@ use std::{
 use crate::{
     ContinuationConfig, ContinuationStore, EventLog, ExtensionRegistry, ExtensionRuntimeHost,
     HubRequest, HubResponse, SpindleError, execute_request_with_continuations,
+    policy::validate_installed_registry,
     protocol::{DEFAULT_JSONL_MESSAGE_LIMIT, read_limited_jsonl_line},
     store::ensure_private_parent,
 };
@@ -27,6 +28,11 @@ const DEFAULT_STREAM_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// Returns an error if the socket cannot be prepared, bound, or used.
 pub fn serve(socket_path: &Path, log: &EventLog) -> Result<(), SpindleError> {
+    let state_dir = socket_path.parent().ok_or(SpindleError::InvalidField {
+        field: "socket",
+        reason: "socket path must have a parent directory",
+    })?;
+    validate_installed_registry(&ExtensionRegistry::in_dir(state_dir))?;
     prepare_socket(socket_path)?;
     let listener = UnixListener::bind(socket_path)?;
     fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600))?;
@@ -487,13 +493,22 @@ mod tests {
             "host",
             &TestHostConfig::with_counting_invoke(registration, "test.rendered"),
         )?;
-        let manifest = dir.join("extension.json");
+        let package = dir.join("test-host");
+        fs::create_dir_all(package.join("bin"))?;
+        let staged_host = package.join("bin/test-host");
+        fs::copy(&host, &staged_host)?;
+        let host_config = host.with_extension("json");
+        if host_config.is_file() {
+            fs::copy(&host_config, staged_host.with_extension("json"))?;
+        }
+        let mut permissions = fs::metadata(&staged_host)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&staged_host, permissions)?;
         fs::write(
-            &manifest,
+            package.join("extension.json"),
             serde_json::to_string_pretty(&json!({
                 "id": "test-host",
                 "version": "0.1.0",
-                "entrypoint": host,
                 "runtime": "stdio-jsonl"
             }))?,
         )?;
@@ -515,8 +530,8 @@ mod tests {
         assert!(matches!(
             send_request(
                 &socket,
-                &HubRequest::RegisterExtension {
-                    manifest,
+                &HubRequest::InstallExtension {
+                    package,
                     trust_runtime: true,
                 },
             )?,

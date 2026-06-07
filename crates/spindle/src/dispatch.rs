@@ -442,7 +442,7 @@ fn merge_args(event_data: &Value, route_args: &Value) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
 
     use serde_json::json;
     use spindle_extension_sdk::{ActionOutput, ExtensionRegistration, RegistrationAction};
@@ -554,19 +554,29 @@ mod tests {
                 ..TestHostConfig::with_registration(registration)
             },
         )?;
-        let host_manifest = dir.join("host.json");
+        let host_package = dir.join("test-host");
+        fs::create_dir_all(host_package.join("bin"))?;
+        let staged_host = host_package.join("bin/test-host");
+        fs::copy(&host, &staged_host)?;
+        let host_config = host.with_extension("json");
+        if host_config.is_file() {
+            fs::copy(&host_config, staged_host.with_extension("json"))?;
+        }
+        let mut permissions = fs::metadata(&staged_host)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&staged_host, permissions)?;
         fs::write(
-            &host_manifest,
+            host_package.join("extension.json"),
             serde_json::to_string_pretty(&json!({
                 "id": "test-host",
                 "version": "0.1.0",
-                "entrypoint": host,
                 "runtime": "stdio-jsonl"
             }))?,
         )?;
-        let recipe_manifest = dir.join("recipe.json");
+        let recipe_package = dir.join("test-recipe");
+        fs::create_dir_all(&recipe_package)?;
         fs::write(
-            &recipe_manifest,
+            recipe_package.join("extension.json"),
             r#"{
               "id": "test-recipe",
               "version": "0.1.0",
@@ -589,8 +599,8 @@ mod tests {
         )?;
         let registry = ExtensionRegistry::in_dir(&dir);
         let runtime = ExtensionRuntimeHost::new();
-        registry.install_manifest_with_runtime(&host_manifest, &runtime)?;
-        registry.install_manifest(&recipe_manifest)?;
+        registry.install_manifest_with_runtime(&host_package, &runtime)?;
+        registry.install_manifest(&recipe_package)?;
         let event = Event::builder(String::from("test.initial"), String::from("unit"))
             .data(json!({}))
             .build()?;
@@ -621,9 +631,8 @@ mod tests {
         let provider = RegisteredExtension {
             id: String::from("aerospace"),
             version: String::from("0.1.0"),
-            manifest_path: PathBuf::from("/tmp/aerospace/extension.json"),
+            package_root: PathBuf::from("/tmp/aerospace"),
             runtime: ExtensionRuntime::StdioJsonl,
-            entrypoint: Some(String::from("provider")),
             capabilities: vec![String::from("aerospace.state.read")],
             emits: vec![String::from("aerospace.workspace.changed")],
             produces: vec![String::from("aerospace.workspace.snapshot")],
@@ -640,9 +649,8 @@ mod tests {
         let workflow = RegisteredExtension {
             id: String::from("workspace-indicator"),
             version: String::from("0.1.0"),
-            manifest_path: PathBuf::from("/tmp/workspace-indicator/extension.json"),
+            package_root: PathBuf::from("/tmp/workspace-indicator"),
             runtime: ExtensionRuntime::StdioJsonl,
-            entrypoint: Some(String::from("workflow")),
             capabilities: Vec::new(),
             emits: Vec::new(),
             produces: vec![String::from(

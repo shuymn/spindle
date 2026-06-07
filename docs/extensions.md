@@ -2,36 +2,36 @@
 
 ## Installing extensions
 
-Install an extension by passing either a manifest path or a directory containing a manifest.
+Install an extension package by passing a package directory. `install` stages the package into `$SPINDLE_STATE_DIR/extensions/{id}/` and records the staged entrypoint SHA-256 in the registry.
 
 ```bash
-cargo run -p spindle -- install /path/to/my-extension/extension.json
 cargo run -p spindle -- install /path/to/my-extension
 ```
 
-Validate a manifest without starting the extension host.
+An extension package is a directory containing `extension.json` and, for `stdio-jsonl` extensions, a binary at `bin/{id}` where `{id}` matches the manifest `id`. The daemon executes staged copies under the state directory; it does not depend on the original source tree or nix store path at runtime.
+
+Validate a manifest without staging or starting the extension host.
 
 ```bash
 cargo run -p spindle -- extension validate /path/to/my-extension/extension.json
 ```
 
-When an extension route references events or actions owned by another extension, install the provider extension first. Route validation runs at install time and checks that referenced sources, events, and actions exist in the registry.
+Install all required extensions in any order. Cross-extension route completeness is validated at daemon startup and by `spindle policy validate`, not during individual installs.
 
-`extension validate` reads only the static manifest and does not run the entrypoint. `install` / `extension register` register only the static manifest surface by default.
+`extension validate` reads only the static manifest and does not run the entrypoint. `install` stages the package and records static manifest surface by default.
 
-For a `stdio-jsonl` extension, pass `--trust-runtime` when you want to start the entrypoint and receive dynamic surface from the `register` request. `--trust-runtime` executes the entrypoint for dynamic surface discovery and records the current entrypoint path / SHA-256 in the registry. To inspect dynamic surface without writing the registry, use `extension surface --trust-runtime <manifest>`.
+For a `stdio-jsonl` extension, pass `--trust-runtime` when you want to start the entrypoint and receive dynamic surface from the `register` request. `--trust-runtime` executes the source entrypoint for dynamic surface discovery, then stages the package and records the staged entrypoint path / SHA-256 in the registry. To inspect dynamic surface without writing the registry, use `extension surface --trust-runtime <manifest>`.
 
 ## Manifest and registration surface
 
-A `stdio-jsonl` manifest contains the extension ID, version, entrypoint, and runtime. For static installation, it also contains the event/action/capability surface.
+A `stdio-jsonl` manifest contains the extension ID, version, and runtime. For static installation, it also contains the event/action/capability surface. The executable path is not declared in the manifest; install resolves `bin/{id}` inside the package.
 
-A manifest with empty surface requires dynamic registration through `install --trust-runtime` or `extension register --trust-runtime`. Static registration does not run the entrypoint during install/register. However, invoking a `stdio-jsonl` extension action does run the entrypoint. If you need entrypoint change detection, register with `--trust-runtime`.
+A manifest with empty surface requires dynamic registration through `install --trust-runtime`. Static install does not run the host. However, invoking a `stdio-jsonl` extension action does run the staged host at `bin/{id}`.
 
 ```json
 {
   "id": "my-extension",
   "version": "0.1.0",
-  "entrypoint": "./target/release/my-extension",
   "runtime": "stdio-jsonl"
 }
 ```
@@ -39,9 +39,11 @@ A manifest with empty surface requires dynamic registration through `install --t
 The repository includes a workspace example extension:
 
 ```bash
-cargo build -p spindle-extension-example --release --locked
+task extension-example:prepare
 cargo run -p spindle -- install crates/spindle-extension-example
 ```
+
+For nix or other distribution layouts, build packages with `extension.json` plus `bin/...` under `share/extensions/{id}/`, then install from that directory. `install` copies the package into the spindle state directory on each bootstrap.
 
 Event/action/capability surface can be written statically in the manifest, but `stdio-jsonl` extensions usually register it from extension code through the SDK.
 

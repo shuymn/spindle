@@ -11,7 +11,7 @@ use serde_json::Value;
 use crate::{
     CapabilityPolicy, EventFilter, EventLog, ExtensionManifest, ExtensionRegistry,
     ExtensionRuntimeHost, HubRequest, SpindleError, execute_request, send_request, serve,
-    validate_extension_routes, validate_json_object,
+    validate_installed_registry, validate_json_object,
 };
 
 /// Run the spindle command-line interface.
@@ -46,7 +46,7 @@ enum Command {
     Daemon(ServeArgs),
     /// Serve JSONL hub requests over a Unix domain socket.
     Serve(ServeArgs),
-    /// Install an extension package or manifest.
+    /// Install an extension package.
     Install(InstallArgs),
     /// Send one JSONL hub request to a running server.
     Send(SendArgs),
@@ -80,8 +80,8 @@ struct SendArgs {
 struct InstallArgs {
     #[arg(long)]
     trust_runtime: bool,
-    #[arg(value_name = "EXTENSION")]
-    extension: PathBuf,
+    #[arg(value_name = "PACKAGE")]
+    package: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -154,22 +154,12 @@ enum ExtensionSubcommand {
     Validate(ValidateExtensionArgs),
     /// Show runtime-discovered extension surface without registering it.
     Surface(SurfaceExtensionArgs),
-    /// Register or replace an extension manifest.
-    Register(RegisterExtensionArgs),
-    /// List registered extensions.
+    /// List installed extensions.
     List,
 }
 
 #[derive(Debug, Args)]
 struct ValidateExtensionArgs {
-    #[arg(value_name = "MANIFEST")]
-    manifest: PathBuf,
-}
-
-#[derive(Debug, Args)]
-struct RegisterExtensionArgs {
-    #[arg(long)]
-    trust_runtime: bool,
     #[arg(value_name = "MANIFEST")]
     manifest: PathBuf,
 }
@@ -194,11 +184,12 @@ fn run_cli(cli: Cli) -> Result<()> {
             serve(&socket, &log)?;
         }
         Command::Install(args) => {
-            let manifest = resolve_install_manifest(&args.extension);
             let registered = if args.trust_runtime {
-                registry.install_manifest_with_runtime(&manifest, &runtime)?
+                registry.install_manifest_with_runtime(&args.package, &runtime)?
             } else {
-                registry.install_manifest(&manifest)?
+                let registered = registry.install_manifest(&args.package)?;
+                runtime.invalidate_extension(&registered.id);
+                registered
             };
             write_json(&registered)?;
         }
@@ -271,16 +262,6 @@ fn run_cli(cli: Cli) -> Result<()> {
             write_json(&manifest)?;
         }
         Command::Extension(ExtensionCommand {
-            command: ExtensionSubcommand::Register(args),
-        }) => {
-            let registered = if args.trust_runtime {
-                registry.register_manifest_trusting_runtime(&args.manifest, &runtime)?
-            } else {
-                registry.register_manifest(&args.manifest)?
-            };
-            write_json(&registered)?;
-        }
-        Command::Extension(ExtensionCommand {
             command: ExtensionSubcommand::List,
         }) => {
             let extensions = registry.list()?;
@@ -289,12 +270,8 @@ fn run_cli(cli: Cli) -> Result<()> {
         Command::Policy(PolicyCommand {
             command: PolicySubcommand::Validate,
         }) => {
+            validate_installed_registry(&registry)?;
             let policy = CapabilityPolicy::load(&state_dir)?;
-            let extensions = registry.list()?;
-            for extension in &extensions {
-                validate_extension_routes(extension, &extensions, &policy)?;
-            }
-            policy.validate_against_extensions(&extensions)?;
             write_json(&policy)?;
         }
     }
@@ -338,17 +315,9 @@ fn resolve_socket_path(state_dir: &std::path::Path, explicit: Option<PathBuf>) -
     explicit.unwrap_or_else(|| state_dir.join("spindle.sock"))
 }
 
-fn resolve_install_manifest(extension: &std::path::Path) -> PathBuf {
-    if extension.is_dir() {
-        return extension.join("extension.json");
-    }
-
-    extension.to_path_buf()
-}
-
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, os::unix::fs::PermissionsExt};
 
     use spindle_extension_sdk::{ExtensionRegistration, RegistrationAction};
     use spindle_test_host::TestHostConfig;
@@ -387,14 +356,24 @@ mod tests {
             "host",
             &TestHostConfig::with_registration(registration),
         )?;
-        let manifest = dir.join("extension.json");
+        let package = dir.join("surface-only");
+        fs::create_dir_all(package.join("bin"))?;
+        let staged_host = package.join("bin/surface-only");
+        fs::copy(&host, &staged_host)?;
+        let host_config = host.with_extension("json");
+        if host_config.is_file() {
+            fs::copy(&host_config, staged_host.with_extension("json"))?;
+        }
+        let mut permissions = fs::metadata(&staged_host)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&staged_host, permissions)?;
+        let manifest = package.join("extension.json");
         fs::write(
             &manifest,
             serde_json::to_string_pretty(&serde_json::json!({
                 "id": "surface-only",
                 "version": "0.1.0",
                 "runtime": "stdio-jsonl",
-                "entrypoint": host,
                 "capabilities": [],
                 "actions": {}
             }))?,
@@ -453,9 +432,12 @@ mod tests {
     fn policy_validate_cli_succeeds_for_installed_extensions() -> Result<()> {
         let dir = crate::store::tests_support::test_dir()?;
         fs::create_dir_all(&dir)?;
-        let workflow_manifest = dir.join("workflow.json");
+        let workflow_package = dir.join("workflow");
+        let provider_package = dir.join("provider");
+        fs::create_dir_all(&workflow_package)?;
+        fs::create_dir_all(provider_package.join("bin"))?;
         fs::write(
-            &workflow_manifest,
+            workflow_package.join("extension.json"),
             r#"{
           "id": "workflow",
           "version": "0.1.0",
@@ -470,26 +452,23 @@ mod tests {
           ]
         }"#,
         )?;
-        let provider_host = dir.join("provider-host.sh");
-        crate::store::tests_support::write_executable(&provider_host, "#!/bin/sh\nexit 0\n")?;
-        let provider_manifest = dir.join("provider.json");
+        crate::store::tests_support::write_executable(
+            &provider_package.join("bin/provider"),
+            "#!/bin/sh\nexit 0\n",
+        )?;
         fs::write(
-            &provider_manifest,
-            format!(
-                r#"{{
+            provider_package.join("extension.json"),
+            r#"{
           "id": "provider",
           "version": "0.1.0",
-          "entrypoint": "{}",
           "runtime": "stdio-jsonl",
           "emits": ["provider.changed"],
-          "actions": {{
-            "provider.snapshot": {{
+          "actions": {
+            "provider.snapshot": {
               "capabilities": []
-            }}
-          }}
-        }}"#,
-                provider_host.display()
-            ),
+            }
+          }
+        }"#,
         )?;
         crate::store::tests_support::write_capability_policy(
             &dir,
@@ -497,8 +476,8 @@ mod tests {
         )?;
 
         let registry = ExtensionRegistry::in_dir(&dir);
-        registry.register_manifest(&provider_manifest)?;
-        registry.register_manifest(&workflow_manifest)?;
+        registry.install_manifest(&provider_package)?;
+        registry.install_manifest(&workflow_package)?;
 
         run_cli(Cli {
             state_dir: Some(dir.clone()),
@@ -509,23 +488,5 @@ mod tests {
 
         fs::remove_dir_all(dir)?;
         Ok(())
-    }
-
-    #[test]
-    fn install_directory_resolves_to_extension_manifest() -> Result<()> {
-        let dir = crate::store::tests_support::test_dir()?;
-        fs::create_dir_all(&dir)?;
-        assert_eq!(
-            resolve_install_manifest(dir.as_path()),
-            dir.join("extension.json")
-        );
-        fs::remove_dir_all(dir)?;
-        Ok(())
-    }
-
-    #[test]
-    fn install_manifest_path_is_used_as_is() {
-        let path = PathBuf::from("/tmp/my-extension/extension.json");
-        assert_eq!(resolve_install_manifest(path.as_path()), path);
     }
 }

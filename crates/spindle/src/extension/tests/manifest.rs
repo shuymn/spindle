@@ -13,7 +13,6 @@ fn manifest_allows_action_capabilities_without_providing_them() -> Result<(), Sp
     let manifest = ExtensionManifest {
         id: String::from("sketchybar-agent-status"),
         version: String::from("0.1.0"),
-        entrypoint: Some(String::from("./bin/extension")),
         runtime: ExtensionRuntime::StdioJsonl,
         emits: Vec::new(),
         produces: Vec::new(),
@@ -38,7 +37,6 @@ fn manifest_rejects_duplicate_action_capabilities() {
     let manifest = ExtensionManifest {
         id: String::from("duplicate-action-capability"),
         version: String::from("0.1.0"),
-        entrypoint: Some(String::from("./bin/extension")),
         runtime: ExtensionRuntime::StdioJsonl,
         emits: Vec::new(),
         produces: Vec::new(),
@@ -68,7 +66,6 @@ fn manifest_rejects_recipe_actions() {
     let manifest = ExtensionManifest {
         id: String::from("recipe-with-actions"),
         version: String::from("0.1.0"),
-        entrypoint: None,
         runtime: ExtensionRuntime::Recipe,
         emits: Vec::new(),
         produces: Vec::new(),
@@ -91,7 +88,6 @@ fn manifest_rejects_duplicate_route_capabilities() {
     let manifest = ExtensionManifest {
         id: String::from("duplicate-route-capability"),
         version: String::from("0.1.0"),
-        entrypoint: None,
         runtime: ExtensionRuntime::Recipe,
         emits: Vec::new(),
         produces: Vec::new(),
@@ -121,7 +117,6 @@ fn manifest_rejects_legacy_action_command_metadata() {
         r#"{
           "id": "legacy-host",
           "version": "0.1.0",
-          "entrypoint": "./bin/extension",
           "actions": {
             "legacy.render": {
               "capabilities": [],
@@ -139,7 +134,6 @@ fn manifest_rejects_emit_produce_overlap() {
     let manifest = ExtensionManifest {
         id: String::from("overlap"),
         version: String::from("0.1.0"),
-        entrypoint: None,
         runtime: ExtensionRuntime::Recipe,
         emits: vec![String::from("shared.event")],
         produces: vec![String::from("shared.event")],

@@ -86,7 +86,7 @@ The default socket path is `<state-dir>/spindle.sock`. Use `--socket` to set it 
 
 When an action requires capabilities, direct invokes and routes must grant those capabilities. The grants must also be allowed by `capabilities.json` in the state directory.
 
-Route capabilities are checked both during dispatch and when an extension is installed or registered. Route grant policy is keyed by route owner extension ID and specifies the allowed event `source`, event kind, and capabilities.
+Route capabilities are checked both during dispatch and when an extension is installed. Route grant policy is keyed by route owner extension ID and specifies the allowed event `source`, event kind, and capabilities.
 
 ```json
 {
@@ -167,7 +167,8 @@ A policy grantor cannot be `*`. Capability values may be `*`, but this broadens 
 The state directory mainly contains these files:
 
 - `events.jsonl` — append-only event log
-- `extensions.json` — installed/registered extensions
+- `extensions.json` — installed extensions
+- `extensions/{id}/` — staged extension packages (`extension.json`, `bin/...`)
 - `capabilities.json` — emit / direct / route grant policy
 - `spindle.sock` — daemon Unix socket
 

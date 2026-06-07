@@ -6,7 +6,10 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ExtensionRoute, ExtensionRuntime, RegisteredExtension, SpindleError, validate_name};
+use crate::{
+    ExtensionRegistry, ExtensionRoute, ExtensionRuntime, RegisteredExtension, SpindleError,
+    validate_name,
+};
 
 const POLICY_FILE: &str = "capabilities.json";
 const WILDCARD: &str = "*";
@@ -236,6 +239,32 @@ pub fn validate_extension_routes(
         }
     }
     Ok(())
+}
+
+/// Validate installed extensions and capability policy before daemon startup.
+///
+/// # Errors
+///
+/// Returns an aggregate error when any route or policy grant is unresolved.
+pub fn validate_installed_registry(registry: &ExtensionRegistry) -> Result<(), SpindleError> {
+    let policy = CapabilityPolicy::load(registry.state_dir())?;
+    let extensions = registry.list()?;
+    let mut messages = Vec::new();
+
+    for extension in &extensions {
+        if let Err(error) = validate_extension_routes(extension, &extensions, &policy) {
+            messages.push(format!("{}: {error}", extension.id));
+        }
+    }
+    if let Err(error) = policy.validate_against_extensions(&extensions) {
+        messages.push(error.to_string());
+    }
+
+    if messages.is_empty() {
+        return Ok(());
+    }
+
+    Err(SpindleError::RegistryValidationFailed { messages })
 }
 
 fn routable_actions(extensions: &[RegisteredExtension]) -> BTreeSet<&str> {
@@ -755,9 +784,8 @@ mod tests {
         RegisteredExtension {
             id: String::from(id),
             version: String::from("0.1.0"),
-            manifest_path: PathBuf::from(format!("/tmp/{id}.json")),
+            package_root: PathBuf::from(format!("/tmp/{id}")),
             runtime: ExtensionRuntime::StdioJsonl,
-            entrypoint: Some(String::from("./bin/extension")),
             capabilities: Vec::new(),
             emits: emits.iter().map(|event| String::from(*event)).collect(),
             produces: produces.iter().map(|event| String::from(*event)).collect(),

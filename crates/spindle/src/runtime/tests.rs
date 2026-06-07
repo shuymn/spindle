@@ -1,5 +1,6 @@
 use std::{
     fs,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{Arc, Barrier},
@@ -17,21 +18,13 @@ use spindle_test_host::{
 use super::*;
 
 #[test]
-fn relative_manifest_path_resolves_from_manifest_directory() {
+fn resolve_package_binary_uses_conventional_layout() {
     assert_eq!(
-        resolve_manifest_path(
-            Path::new("/tmp/spindle/extensions/sketchybar/extension.json"),
-            "../../target/release/spindle-sketchybar",
+        resolve_package_binary(
+            Path::new("/tmp/spindle/extensions/sketchybar"),
+            "sketchybar",
         ),
-        PathBuf::from("/tmp/spindle/target/release/spindle-sketchybar")
-    );
-}
-
-#[test]
-fn relative_entrypoint_preserves_leading_parent_segments() {
-    assert_eq!(
-        resolve_manifest_path(Path::new("extension.json"), "../bin/spindle-test"),
-        PathBuf::from("../bin/spindle-test")
+        PathBuf::from("/tmp/spindle/extensions/sketchybar/bin/sketchybar")
     );
 }
 
@@ -49,23 +42,23 @@ fn stdio_host_registers_and_invokes_without_respawning() -> Result<(), SpindleEr
         &TestHostConfig::with_counting_invoke(registration, "test.rendered"),
     )?;
 
-    let manifest = stdio_manifest("test-host", &host);
+    let (manifest, package_root) = stdio_package(&dir, "test-host", &host)?;
     let runtime = ExtensionRuntimeHost::new();
 
-    let registration = runtime
-        .load_registration(&manifest, &dir.join("extension.json"))?
-        .ok_or(SpindleError::InvalidField {
-            field: "registration",
-            reason: "missing",
-        })?;
+    let registration =
+        runtime
+            .load_registration(&manifest, &package_root)?
+            .ok_or(SpindleError::InvalidField {
+                field: "registration",
+                reason: "missing",
+            })?;
     assert_eq!(registration.emits, vec![String::from("test.changed")]);
 
     let registered = RegisteredExtension {
         id: String::from("test-host"),
         version: String::from("0.1.0"),
-        manifest_path: dir.join("extension.json"),
+        package_root: dir.clone(),
         runtime: ExtensionRuntime::StdioJsonl,
-        entrypoint: Some(host.to_string_lossy().into_owned()),
         capabilities: registration.capabilities,
         emits: registration.emits,
         produces: registration.produces,
@@ -115,10 +108,10 @@ fn stdio_host_registration_times_out() -> Result<(), SpindleError> {
         },
     )?;
 
-    let manifest = stdio_manifest("silent-host", &host);
+    let (manifest, package_root) = stdio_package(&dir, "silent-host", &host)?;
     let runtime = ExtensionRuntimeHost::with_timeout(Duration::from_millis(50));
 
-    let result = runtime.load_registration(&manifest, &dir.join("extension.json"));
+    let result = runtime.load_registration(&manifest, &package_root);
 
     assert!(matches!(
         result,
@@ -141,9 +134,9 @@ fn stdio_host_rejects_oversized_response_line() -> Result<(), SpindleError> {
         },
     )?;
 
-    let manifest = stdio_manifest("oversized-host", &host);
+    let (manifest, package_root) = stdio_package(&dir, "oversized-host", &host)?;
     let runtime = ExtensionRuntimeHost::new();
-    let result = runtime.load_registration(&manifest, &dir.join("extension.json"));
+    let result = runtime.load_registration(&manifest, &package_root);
 
     assert!(matches!(result, Err(SpindleError::MessageTooLarge { .. })));
     fs::remove_dir_all(dir)?;
@@ -170,10 +163,10 @@ fn registration_protocol_error_drops_and_terminates_temporary_session() -> Resul
             ..TestHostConfig::default()
         },
     )?;
-    let manifest = stdio_manifest("invalid-registration-host", &host);
+    let (manifest, package_root) = stdio_package(&dir, "invalid-registration-host", &host)?;
     let runtime = ExtensionRuntimeHost::new();
 
-    let result = runtime.load_registration(&manifest, &dir.join("extension.json"));
+    let result = runtime.load_registration(&manifest, &package_root);
 
     assert!(matches!(
         result,
@@ -202,10 +195,10 @@ fn registration_oversized_response_drops_and_terminates_temporary_session()
             ..TestHostConfig::default()
         },
     )?;
-    let manifest = stdio_manifest("oversized-registration-host", &host);
+    let (manifest, package_root) = stdio_package(&dir, "oversized-registration-host", &host)?;
     let runtime = ExtensionRuntimeHost::new();
 
-    let result = runtime.load_registration(&manifest, &dir.join("extension.json"));
+    let result = runtime.load_registration(&manifest, &package_root);
 
     assert!(matches!(result, Err(SpindleError::MessageTooLarge { .. })));
     wait_for_process_exit(&pid_file, Duration::from_secs(2))?;
@@ -226,11 +219,11 @@ fn stdio_host_shutdown_kills_host_that_acknowledges_without_exiting() -> Result<
         },
     )?;
 
-    let manifest = stdio_manifest("slow-shutdown-host", &host);
+    let (manifest, package_root) = stdio_package(&dir, "slow-shutdown-host", &host)?;
     let runtime = ExtensionRuntimeHost::with_timeout(Duration::from_secs(10));
 
     let started = Instant::now();
-    let registration = runtime.load_registration(&manifest, &dir.join("extension.json"))?;
+    let registration = runtime.load_registration(&manifest, &package_root)?;
 
     assert!(registration.is_some());
     assert!(started.elapsed() < Duration::from_secs(15));
@@ -283,8 +276,8 @@ done
 "#,
     )?;
     let runtime = Arc::new(ExtensionRuntimeHost::with_timeout(Duration::from_secs(10)));
-    let slow = registered_stdio_extension(&dir, "slow", &slow_host);
-    let fast = registered_stdio_extension(&dir, "fast", &fast_host);
+    let slow = registered_stdio_extension(&dir, "slow", &slow_host)?;
+    let fast = registered_stdio_extension(&dir, "fast", &fast_host)?;
     let slow_runtime = Arc::clone(&runtime);
     let slow_handle = thread::spawn(move || {
         slow_runtime.invoke_action(
@@ -351,7 +344,7 @@ done
     let runtime = Arc::new(ExtensionRuntimeHost::new());
     let first_runtime = Arc::clone(&runtime);
     let second_runtime = Arc::clone(&runtime);
-    let first = registered_stdio_extension(&dir, "serialized", &host);
+    let first = registered_stdio_extension(&dir, "serialized", &host)?;
     let second = first.clone();
 
     let started = Instant::now();
@@ -409,7 +402,7 @@ fn concurrent_first_invocations_spawn_one_stdio_session() -> Result<(), SpindleE
         },
     )?;
     let runtime = Arc::new(ExtensionRuntimeHost::new());
-    let extension = registered_stdio_extension(&dir, "single-spawn", &host);
+    let extension = registered_stdio_extension(&dir, "single-spawn", &host)?;
     let barrier = Arc::new(Barrier::new(3));
     let first_runtime = Arc::clone(&runtime);
     let first_extension = extension.clone();
@@ -494,7 +487,7 @@ fn shutdown_races_with_first_session_creation() -> Result<(), SpindleError> {
         },
     )?;
     let runtime = Arc::new(ExtensionRuntimeHost::new());
-    let extension = registered_stdio_extension(&dir, "slow-start", &host);
+    let extension = registered_stdio_extension(&dir, "slow-start", &host)?;
     let invoke_runtime = Arc::clone(&runtime);
     let invoke_extension = extension.clone();
     let handle = thread::spawn(move || {
@@ -565,7 +558,7 @@ fn stale_session_removal_does_not_evict_replacement_session() -> Result<(), Spin
         },
     )?;
     let runtime = ExtensionRuntimeHost::new();
-    let extension = registered_stdio_extension(&dir, "replacement-safe", &host);
+    let extension = registered_stdio_extension(&dir, "replacement-safe", &host)?;
 
     let first = runtime.invoke_action(
         &extension,
@@ -639,7 +632,7 @@ fn unexpected_registration_response_evicts_stdio_session() -> Result<(), Spindle
         },
     )?;
     let runtime = ExtensionRuntimeHost::new();
-    let extension = registered_stdio_extension(&dir, "unexpected-response", &host);
+    let extension = registered_stdio_extension(&dir, "unexpected-response", &host)?;
 
     let first = runtime.invoke_action(
         &extension,
@@ -683,7 +676,7 @@ fn action_error_response_does_not_evict_stdio_session() -> Result<(), SpindleErr
         },
     )?;
     let runtime = ExtensionRuntimeHost::new();
-    let extension = registered_stdio_extension(&dir, "action-error", &host);
+    let extension = registered_stdio_extension(&dir, "action-error", &host)?;
 
     let first = runtime.invoke_action(
         &extension,
@@ -773,7 +766,7 @@ impl RecoveryScenario {
         fs::create_dir_all(&dir)?;
         let host = self.write_host(&dir)?;
         let runtime = self.runtime();
-        let extension = registered_stdio_extension(&dir, self.id(), &host);
+        let extension = registered_stdio_extension(&dir, self.id(), &host)?;
 
         let first = runtime.invoke_action(
             &extension,
@@ -864,35 +857,69 @@ fn process_is_alive(pid: u32) -> Result<bool, SpindleError> {
         .success())
 }
 
-fn stdio_manifest(id: &str, host: &Path) -> ExtensionManifest {
-    ExtensionManifest {
+fn stdio_package(
+    dir: &Path,
+    id: &str,
+    host: &Path,
+) -> Result<(ExtensionManifest, PathBuf), SpindleError> {
+    fs::create_dir_all(dir.join("bin"))?;
+    let staged_host = dir.join("bin").join(id);
+    fs::copy(host, &staged_host)?;
+    let host_config = host.with_extension("json");
+    if host_config.is_file() {
+        fs::copy(&host_config, staged_host.with_extension("json"))?;
+    }
+    let mut permissions = fs::metadata(&staged_host)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&staged_host, permissions)?;
+    let manifest = ExtensionManifest {
         id: String::from(id),
         version: String::from("0.1.0"),
-        entrypoint: Some(host.to_string_lossy().into_owned()),
         runtime: ExtensionRuntime::StdioJsonl,
         emits: Vec::new(),
         produces: Vec::new(),
         capabilities: Vec::new(),
         actions: BTreeMap::new(),
         routes: Vec::new(),
-    }
+    };
+    Ok((manifest, dir.to_path_buf()))
 }
 
-fn registered_stdio_extension(dir: &Path, id: &str, host: &Path) -> RegisteredExtension {
+fn registered_stdio_extension(
+    dir: &Path,
+    id: &str,
+    host: &Path,
+) -> Result<RegisteredExtension, SpindleError> {
+    let package = dir.join(id);
+    fs::create_dir_all(package.join("bin"))?;
+    let staged_host = package.join("bin").join(id);
+    fs::copy(host, &staged_host)?;
+    let host_config = host.with_extension("json");
+    if host_config.is_file() {
+        fs::copy(&host_config, staged_host.with_extension("json"))?;
+    }
+    let mut permissions = fs::metadata(&staged_host)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&staged_host, permissions)?;
+    let entrypoint_path = fs::canonicalize(&staged_host)?;
+    let entrypoint_sha256 = crate::extension::sha256_file(&entrypoint_path)?;
     let action = crate::ExtensionAction {
         capabilities: Vec::new(),
     };
-    RegisteredExtension {
+    Ok(RegisteredExtension {
         id: String::from(id),
         version: String::from("0.1.0"),
-        manifest_path: dir.join(format!("{id}.json")),
+        package_root: package,
         runtime: ExtensionRuntime::StdioJsonl,
-        entrypoint: Some(host.to_string_lossy().into_owned()),
         capabilities: Vec::new(),
         emits: Vec::new(),
         produces: Vec::new(),
         actions: BTreeMap::from([(String::from("test.render"), action)]),
         routes: Vec::new(),
-        runtime_trust: None,
-    }
+        runtime_trust: Some(crate::RegisteredRuntimeTrust {
+            entrypoint_path,
+            entrypoint_sha256,
+            registered_at_unix_ms: 0,
+        }),
+    })
 }

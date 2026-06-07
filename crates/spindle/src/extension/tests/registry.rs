@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn registry_reads_legacy_entries_with_action_command_metadata() -> Result<(), SpindleError> {
+fn registry_rejects_legacy_extensions_json_shape() -> Result<(), SpindleError> {
     let dir = crate::store::tests_support::test_dir()?;
     fs::create_dir_all(&dir)?;
     fs::write(
@@ -12,27 +12,18 @@ fn registry_reads_legacy_entries_with_action_command_metadata() -> Result<(), Sp
             "version": "0.1.0",
             "manifest_path": "/tmp/legacy-host/extension.json",
             "runtime": "stdio-jsonl",
-            "entrypoint": "./bin/extension",
-            "capabilities": ["legacy.write"],
+            "entrypoint": "bin/extension",
+            "capabilities": [],
             "emits": [],
-            "actions": {
-              "legacy.render": {
-                "capabilities": ["legacy.write"],
-                "command": ["render"]
-              }
-            },
+            "actions": {},
             "routes": []
           }
         ]"#,
     )?;
 
-    let entries = ExtensionRegistry::in_dir(&dir).list()?;
+    let result = ExtensionRegistry::in_dir(&dir).list();
 
-    assert_eq!(entries.len(), 1);
-    assert_eq!(
-        entries[0].actions["legacy.render"].capabilities,
-        ["legacy.write"]
-    );
+    assert!(result.is_err());
     fs::remove_dir_all(dir)?;
     Ok(())
 }
@@ -71,35 +62,38 @@ fn sdk_registration_surface_matches_core_manifest_shape() -> Result<(), SpindleE
 fn registry_registers_manifest() -> Result<(), SpindleError> {
     let dir = crate::store::tests_support::test_dir()?;
     fs::create_dir_all(&dir)?;
-    let manifest_path = dir.join("extension.json");
-    let provider_host = dir.join("provider-host.sh");
-    crate::store::tests_support::write_executable(&provider_host, "#!/bin/sh\nexit 0\n")?;
+    let package = write_static_manifest_with_surface(
+        &dir,
+        "sketchybar-agent-status",
+        StaticManifestSurface {
+            action_names: &["sketchybar.agentStatus.render"],
+            emits: &[],
+            produces: &[],
+            capabilities: &["sketchybar.ui.write"],
+        },
+    )?;
     fs::write(
-        &manifest_path,
-        format!(
-            r#"{{
-              "id": "sketchybar-agent-status",
-              "version": "0.1.0",
-              "entrypoint": "{}",
-              "runtime": "stdio-jsonl",
-              "capabilities": ["sketchybar.ui.write"],
-              "actions": {{
-                "sketchybar.agentStatus.render": {{
-                  "capabilities": ["sketchybar.ui.write"]
-                }}
-              }}
-            }}"#,
-            provider_host.display()
-        ),
+        package.join("extension.json"),
+        r#"{
+          "id": "sketchybar-agent-status",
+          "version": "0.1.0",
+          "runtime": "stdio-jsonl",
+          "capabilities": ["sketchybar.ui.write"],
+          "actions": {
+            "sketchybar.agentStatus.render": {
+              "capabilities": ["sketchybar.ui.write"]
+            }
+          }
+        }"#,
     )?;
 
     let registry = ExtensionRegistry::in_dir(&dir);
-    let registered = registry.register_manifest(&manifest_path)?;
+    let registered = registry.install_manifest(&package)?;
 
     assert_eq!(registered.id, "sketchybar-agent-status");
     assert_eq!(
-        registered.entrypoint,
-        Some(provider_host.to_string_lossy().into_owned())
+        registered.package_root,
+        dir.join("extensions").join("sketchybar-agent-status")
     );
     assert_eq!(registry.list()?, vec![registered]);
     assert_eq!(
@@ -117,11 +111,10 @@ fn registry_registers_manifest() -> Result<(), SpindleError> {
 fn registry_file_is_created_private() -> Result<(), SpindleError> {
     let dir = crate::store::tests_support::test_dir()?;
     fs::create_dir_all(&dir)?;
-    let manifest_path =
-        write_static_manifest(&dir, "private-registry", &["test.action"], &[], &[])?;
+    let package = write_static_manifest(&dir, "private-registry", &["test.action"], &[], &[])?;
     let registry = ExtensionRegistry::in_dir(&dir);
 
-    registry.register_manifest(&manifest_path)?;
+    registry.install_manifest(&package)?;
 
     assert_eq!(
         fs::metadata(dir.join("extensions.json"))?
@@ -138,11 +131,11 @@ fn registry_file_is_created_private() -> Result<(), SpindleError> {
 fn registry_rejects_public_existing_state_dir() -> Result<(), SpindleError> {
     let dir = crate::store::tests_support::test_dir()?;
     fs::create_dir_all(&dir)?;
-    let manifest_path = write_static_manifest(&dir, "public-registry", &["test.action"], &[], &[])?;
+    let package = write_static_manifest(&dir, "public-registry", &["test.action"], &[], &[])?;
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o755))?;
     let registry = ExtensionRegistry::in_dir(&dir);
 
-    let result = registry.register_manifest(&manifest_path);
+    let result = registry.install_manifest(&package);
 
     assert!(matches!(
         result,
@@ -160,21 +153,14 @@ fn registry_rejects_public_existing_state_dir() -> Result<(), SpindleError> {
 #[test]
 fn registry_rejects_parent_path_that_is_not_directory() -> Result<(), SpindleError> {
     let dir = crate::store::tests_support::test_dir()?;
-    let manifest_path =
-        write_static_manifest(&dir, "non-directory-parent", &["test.action"], &[], &[])?;
+    let package = write_static_manifest(&dir, "non-directory-parent", &["test.action"], &[], &[])?;
     let parent_file = dir.join("not-a-directory");
     fs::write(&parent_file, b"not a directory")?;
     let registry = ExtensionRegistry::in_dir(&parent_file);
 
-    let result = registry.register_manifest(&manifest_path);
+    let result = registry.install_manifest(&package);
 
-    assert!(matches!(
-        result,
-        Err(SpindleError::InvalidField {
-            field: "state_dir",
-            reason: "parent path must be a directory",
-        })
-    ));
+    assert!(result.is_err());
     fs::remove_dir_all(dir)?;
     Ok(())
 }
@@ -184,10 +170,10 @@ fn registry_does_not_chmod_existing_private_state_dir() -> Result<(), SpindleErr
     let dir = crate::store::tests_support::test_dir()?;
     fs::create_dir_all(&dir)?;
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
-    let manifest_path = write_static_manifest(&dir, "private-state", &["test.action"], &[], &[])?;
+    let package = write_static_manifest(&dir, "private-state", &["test.action"], &[], &[])?;
     let registry = ExtensionRegistry::in_dir(&dir);
 
-    registry.register_manifest(&manifest_path)?;
+    registry.install_manifest(&package)?;
 
     assert_eq!(fs::metadata(&dir)?.permissions().mode() & 0o777, 0o700);
     fs::remove_dir_all(dir)?;

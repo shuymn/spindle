@@ -73,14 +73,16 @@ pub fn execute_request_with_continuations(
             let manifest = ExtensionManifest::from_path(&manifest)?;
             Ok(serde_json::to_value(manifest)?)
         }
-        HubRequest::RegisterExtension {
-            manifest,
+        HubRequest::InstallExtension {
+            package,
             trust_runtime,
         } => {
             let registered = if trust_runtime {
-                registry.register_manifest_trusting_runtime(&manifest, runtime)?
+                registry.install_manifest_with_runtime(&package, runtime)?
             } else {
-                registry.register_manifest(&manifest)?
+                let registered = registry.install_manifest(&package)?;
+                runtime.invalidate_extension(&registered.id);
+                registered
             };
             Ok(serde_json::to_value(registered)?)
         }
@@ -264,7 +266,13 @@ fn state_dir_for_log(log: &EventLog) -> &std::path::Path {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, fs, time::Duration};
+    use std::{
+        collections::BTreeMap,
+        fs,
+        os::unix::fs::PermissionsExt,
+        path::{Path, PathBuf},
+        time::Duration,
+    };
 
     use serde_json::json;
     use spindle_extension_sdk::{ExtensionRegistration, RegistrationAction};
@@ -326,6 +334,44 @@ mod tests {
         Ok(())
     }
 
+    fn prepare_stdio_install_package(
+        dir: &Path,
+        id: &str,
+        host: &Path,
+    ) -> Result<PathBuf, SpindleError> {
+        let package = dir.join(id);
+        fs::create_dir_all(package.join("bin"))?;
+        let staged = package.join("bin").join(id);
+        fs::copy(host, &staged)?;
+        let host_config = host.with_extension("json");
+        if host_config.is_file() {
+            fs::copy(&host_config, staged.with_extension("json"))?;
+        }
+        let mut permissions = fs::metadata(&staged)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&staged, permissions)?;
+        fs::write(
+            package.join("extension.json"),
+            serde_json::to_string_pretty(&json!({
+                "id": id,
+                "version": "0.1.0",
+                "runtime": "stdio-jsonl"
+            }))?,
+        )?;
+        Ok(package)
+    }
+
+    fn prepare_recipe_package(
+        dir: &Path,
+        id: &str,
+        manifest: &str,
+    ) -> Result<PathBuf, SpindleError> {
+        let package = dir.join(id);
+        fs::create_dir_all(&package)?;
+        fs::write(package.join("extension.json"), manifest)?;
+        Ok(package)
+    }
+
     #[test]
     fn execute_emit_appends_event() -> Result<(), SpindleError> {
         let dir = crate::store::tests_support::test_dir()?;
@@ -358,19 +404,10 @@ mod tests {
         let dir = crate::store::tests_support::test_dir()?;
         fs::create_dir_all(&dir)?;
         let host = crate::store::tests_support::test_host_with_write_render(&dir, "adapter-host")?;
-        let adapter_manifest = dir.join("adapter.json");
-        fs::write(
-            &adapter_manifest,
-            serde_json::to_string_pretty(&json!({
-                "id": "test-adapter",
-                "version": "0.1.0",
-                "entrypoint": host,
-                "runtime": "stdio-jsonl"
-            }))?,
-        )?;
-        let recipe_manifest = dir.join("recipe.json");
-        fs::write(
-            &recipe_manifest,
+        let adapter_package = prepare_stdio_install_package(&dir, "test-adapter", &host)?;
+        let recipe_package = prepare_recipe_package(
+            &dir,
+            "test-recipe",
             r#"{
               "id": "test-recipe",
               "version": "0.1.0",
@@ -395,8 +432,8 @@ mod tests {
             &[],
             &[("test-recipe", "test", "test.changed", &["test.write"])],
         )?;
-        registry.install_manifest_with_runtime(&adapter_manifest, &runtime)?;
-        registry.install_manifest(&recipe_manifest)?;
+        registry.install_manifest_with_runtime(&adapter_package, &runtime)?;
+        registry.install_manifest(&recipe_package)?;
 
         let response = execute_request(
             HubRequest::Emit {
@@ -420,21 +457,13 @@ mod tests {
     fn execute_invoke_requires_policy_for_granted_capabilities() -> Result<(), SpindleError> {
         let dir = crate::store::tests_support::test_dir()?;
         fs::create_dir_all(&dir)?;
-        let host = crate::store::tests_support::test_host_with_write_render(&dir, "policy-host")?;
-        let manifest = dir.join("extension.json");
-        fs::write(
-            &manifest,
-            serde_json::to_string_pretty(&json!({
-                "id": "policy-host",
-                "version": "0.1.0",
-                "entrypoint": host,
-                "runtime": "stdio-jsonl"
-            }))?,
-        )?;
+        let host =
+            crate::store::tests_support::test_host_with_write_render(&dir, "policy-host-bin")?;
+        let package = prepare_stdio_install_package(&dir, "policy-host", &host)?;
         let log = EventLog::in_dir(&dir);
         let registry = ExtensionRegistry::in_dir(&dir);
         let runtime = ExtensionRuntimeHost::new();
-        registry.install_manifest_with_runtime(&manifest, &runtime)?;
+        registry.install_manifest_with_runtime(&package, &runtime)?;
 
         let denied = execute_request(
             HubRequest::Invoke {
@@ -491,20 +520,11 @@ mod tests {
             "continuation-host",
             &TestHostConfig::with_registration(registration),
         )?;
-        let manifest = dir.join("extension.json");
-        fs::write(
-            &manifest,
-            serde_json::to_string_pretty(&json!({
-                "id": "test-host",
-                "version": "0.1.0",
-                "entrypoint": host,
-                "runtime": "stdio-jsonl"
-            }))?,
-        )?;
+        let package = prepare_stdio_install_package(&dir, "test-host", &host)?;
         let log = EventLog::in_dir(&dir);
         let registry = ExtensionRegistry::in_dir(&dir);
         let runtime = ExtensionRuntimeHost::new();
-        registry.install_manifest_with_runtime(&manifest, &runtime)?;
+        registry.install_manifest_with_runtime(&package, &runtime)?;
         let continuation = ContinuationConfig {
             store: ContinuationStore::default(),
             socket: dir.join("spindle.sock"),
@@ -553,20 +573,11 @@ mod tests {
             "continuation-deny-host",
             &TestHostConfig::with_registration(registration),
         )?;
-        let manifest = dir.join("extension.json");
-        fs::write(
-            &manifest,
-            serde_json::to_string_pretty(&json!({
-                "id": "test-host",
-                "version": "0.1.0",
-                "entrypoint": host,
-                "runtime": "stdio-jsonl"
-            }))?,
-        )?;
+        let package = prepare_stdio_install_package(&dir, "test-host", &host)?;
         let log = EventLog::in_dir(&dir);
         let registry = ExtensionRegistry::in_dir(&dir);
         let runtime = ExtensionRuntimeHost::new();
-        registry.install_manifest_with_runtime(&manifest, &runtime)?;
+        registry.install_manifest_with_runtime(&package, &runtime)?;
         let continuation = ContinuationConfig {
             store: ContinuationStore::default(),
             socket: dir.join("spindle.sock"),

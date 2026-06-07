@@ -35,7 +35,9 @@ pub use extension::{
     RegisteredExtension, RegisteredRuntimeTrust,
 };
 pub use handler::{execute_request, execute_request_with_continuations};
-pub use policy::{CapabilityPolicy, RouteGrantPolicy, validate_extension_routes};
+pub use policy::{
+    CapabilityPolicy, RouteGrantPolicy, validate_extension_routes, validate_installed_registry,
+};
 pub use protocol::{HubRequest, HubResponse};
 pub use runtime::ExtensionRuntimeHost;
 pub use server::{send_request, send_request_with_timeout, serve};
@@ -228,11 +230,29 @@ pub enum SpindleError {
         action: String,
     },
 
-    /// An installed extension exposes an action but has no entrypoint.
-    #[error("extension {extension} has no entrypoint")]
-    MissingExtensionEntrypoint {
+    /// An extension package entrypoint does not exist.
+    #[error("extension {extension} entrypoint not found: {}", path.display())]
+    EntrypointNotFound {
         /// Extension identifier.
         extension: String,
+        /// Missing entrypoint path.
+        path: PathBuf,
+    },
+
+    /// An extension package entrypoint is not executable.
+    #[error("extension {extension} entrypoint is not executable: {}", path.display())]
+    EntrypointNotExecutable {
+        /// Extension identifier.
+        extension: String,
+        /// Non-executable entrypoint path.
+        path: PathBuf,
+    },
+
+    /// Installed registry validation failed before daemon startup.
+    #[error("registry validation failed:\n{}", messages.join("\n"))]
+    RegistryValidationFailed {
+        /// Validation failure messages.
+        messages: Vec<String>,
     },
 
     /// An extension action process failed.
@@ -383,18 +403,6 @@ pub(crate) fn validate_name(field: &'static str, value: &str) -> Result<(), Spin
 
 pub(crate) fn validate_subject(field: &'static str, value: &str) -> Result<(), SpindleError> {
     validate_non_empty_text(field, value)
-}
-
-pub(crate) fn validate_path_string(field: &'static str, value: &str) -> Result<(), SpindleError> {
-    validate_non_empty_text(field, value)?;
-    if value.contains('\0') {
-        return Err(SpindleError::InvalidField {
-            field,
-            reason: "must not contain NUL bytes",
-        });
-    }
-
-    Ok(())
 }
 
 fn validate_non_empty_text(field: &'static str, value: &str) -> Result<(), SpindleError> {

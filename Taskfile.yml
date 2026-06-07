@@ -24,6 +24,17 @@ tasks:
     cmds:
       - cargo build --workspace --release --locked
 
+  extension-example:prepare:
+    desc: Stage the example extension binary into its package
+    summary: |
+      Copies the release-built example extension into crates/spindle-extension-example/bin/.
+    deps:
+      - task: build:release
+    cmds:
+      - mkdir -p crates/spindle-extension-example/bin
+      - cp target/release/spindle-extension-example crates/spindle-extension-example/bin/spindle-extension-example
+      - chmod 755 crates/spindle-extension-example/bin/spindle-extension-example
+
   run:
     desc: Run the default binary
     summary: |

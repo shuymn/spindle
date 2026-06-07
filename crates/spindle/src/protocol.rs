@@ -82,11 +82,11 @@ pub enum HubRequest {
         /// Manifest path.
         manifest: PathBuf,
     },
-    /// Register an extension manifest.
-    RegisterExtension {
-        /// Manifest path.
-        manifest: PathBuf,
-        /// Execute the manifest entrypoint to collect dynamic surface.
+    /// Install an extension package.
+    InstallExtension {
+        /// Extension package directory.
+        package: PathBuf,
+        /// Execute the package entrypoint to collect dynamic surface.
         #[serde(default)]
         trust_runtime: bool,
     },

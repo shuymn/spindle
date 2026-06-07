@@ -13,27 +13,28 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
-    ExtensionAction, ExtensionManifest, ExtensionRoute, ExtensionRuntime,
+    ExtensionAction, ExtensionManifest, ExtensionRoute, ExtensionRuntime, StagedPackage,
+    materialize_package, resolve_source_package,
+    stage::{refresh_staged_manifest, remove_staged_package},
     surface::ensure_surface_ownership,
 };
 use crate::{
     CapabilityPolicy, ExtensionRuntimeHost, SpindleError, lock::SidecarLock,
-    policy::validate_extension_routes, store::ensure_private_state_parent,
+    runtime::resolve_package_binary, store::ensure_private_state_parent,
 };
 
 /// Registered extension metadata stored by the spindle kernel.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RegisteredExtension {
     /// Extension identifier.
     pub id: String,
     /// Extension version string.
     pub version: String,
-    /// Source manifest path.
-    pub manifest_path: PathBuf,
+    /// Staged extension package root directory.
+    pub package_root: PathBuf,
     /// Runtime used to execute this extension.
     pub runtime: ExtensionRuntime,
-    /// Executable or script path relative to the manifest file.
-    pub entrypoint: Option<String>,
     /// Declared capabilities.
     pub capabilities: Vec<String>,
     /// Event types this extension can emit.
@@ -44,12 +45,12 @@ pub struct RegisteredExtension {
     pub actions: BTreeMap<String, ExtensionAction>,
     /// Routes contributed by this extension package.
     pub routes: Vec<ExtensionRoute>,
-    /// Trusted runtime snapshot captured during dynamic registration.
+    /// Trusted runtime snapshot captured during installation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_trust: Option<RegisteredRuntimeTrust>,
 }
 
-/// Trusted runtime metadata captured at dynamic registration time.
+/// Trusted runtime metadata captured at installation time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisteredRuntimeTrust {
     /// Canonical entrypoint path.
@@ -60,79 +61,17 @@ pub struct RegisteredRuntimeTrust {
     pub registered_at_unix_ms: u64,
 }
 
-impl<'de> Deserialize<'de> for RegisteredExtension {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct WireRegisteredExtension {
-            id: String,
-            version: String,
-            manifest_path: PathBuf,
-            runtime: ExtensionRuntime,
-            entrypoint: Option<String>,
-            capabilities: Vec<String>,
-            emits: Vec<String>,
-            #[serde(default)]
-            produces: Vec<String>,
-            actions: BTreeMap<String, StoredExtensionAction>,
-            routes: Vec<ExtensionRoute>,
-            #[serde(default)]
-            runtime_trust: Option<RegisteredRuntimeTrust>,
-        }
-
-        let stored = WireRegisteredExtension::deserialize(deserializer)?;
-        Ok(Self {
-            id: stored.id,
-            version: stored.version,
-            manifest_path: stored.manifest_path,
-            runtime: stored.runtime,
-            entrypoint: stored.entrypoint,
-            capabilities: stored.capabilities,
-            emits: stored.emits,
-            produces: stored.produces,
-            actions: stored
-                .actions
-                .into_iter()
-                .map(|(name, action)| (name, action.into_current()))
-                .collect(),
-            routes: stored.routes,
-            runtime_trust: stored.runtime_trust,
-        })
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StoredExtensionAction {
-    #[serde(default)]
-    capabilities: Vec<String>,
-    #[serde(default, rename = "command")]
-    _legacy_command: Vec<String>,
-}
-
-impl StoredExtensionAction {
-    fn into_current(self) -> ExtensionAction {
-        ExtensionAction {
-            capabilities: self.capabilities,
-        }
-    }
-}
-
 impl RegisteredExtension {
     fn from_manifest(
         manifest: &ExtensionManifest,
-        manifest_path: PathBuf,
+        package_root: PathBuf,
         runtime_trust: Option<RegisteredRuntimeTrust>,
     ) -> Self {
         Self {
             id: manifest.id.clone(),
             version: manifest.version.clone(),
-            manifest_path,
+            package_root,
             runtime: manifest.runtime,
-            entrypoint: manifest.entrypoint.clone(),
             capabilities: manifest.capabilities.clone(),
             emits: manifest.emits.clone(),
             produces: manifest.produces.clone(),
@@ -164,51 +103,18 @@ impl ExtensionRegistry {
         &self.path
     }
 
-    /// Register or replace an extension manifest.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the manifest cannot be loaded or registry state
-    /// cannot be read or written.
-    pub fn register_manifest(
+    fn record_staged_extension(
         &self,
-        manifest_path: &Path,
-    ) -> Result<RegisteredExtension, SpindleError> {
-        let manifest = ExtensionManifest::from_path(manifest_path)?;
-        self.register_manifest_surface(manifest_path, &manifest, None)
-    }
-
-    /// Register or replace an extension manifest using trusted runtime surface.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the manifest cannot be loaded or registry state
-    /// cannot be read or written.
-    pub fn register_manifest_trusting_runtime(
-        &self,
-        manifest_path: &Path,
-        runtime: &ExtensionRuntimeHost,
-    ) -> Result<RegisteredExtension, SpindleError> {
-        let mut manifest = ExtensionManifest::from_path(manifest_path)?;
-        let runtime_trust = RuntimeTrustSnapshot::for_manifest(manifest_path, &manifest)?;
-        manifest.apply_runtime_registration(manifest_path, runtime)?;
-        manifest.validate()?;
-        let runtime_trust = RuntimeTrustSnapshot::verify(runtime_trust, &manifest.id)?;
-        let registered = self.register_manifest_surface(manifest_path, &manifest, runtime_trust)?;
-        runtime.invalidate_extension(&registered.id);
-        Ok(registered)
-    }
-
-    fn register_manifest_surface(
-        &self,
-        manifest_path: &Path,
+        staged: &StagedPackage,
         manifest: &ExtensionManifest,
         runtime_trust: Option<RegisteredRuntimeTrust>,
     ) -> Result<RegisteredExtension, SpindleError> {
         ensure_static_surface(manifest)?;
-        let canonical_path = fs::canonicalize(manifest_path)?;
-        let registered =
-            RegisteredExtension::from_manifest(manifest, canonical_path, runtime_trust);
+        let registered = RegisteredExtension::from_manifest(
+            manifest,
+            staged.package_root.clone(),
+            runtime_trust,
+        );
         let policy = CapabilityPolicy::load(self.state_dir())?;
         policy.ensure_route_grants(&registered)?;
 
@@ -217,8 +123,6 @@ impl ExtensionRegistry {
         let mut entries = self.list()?;
         entries.retain(|entry| entry.id != registered.id);
         entries.push(registered.clone());
-        validate_extension_routes(&registered, &entries, &policy)?;
-        // `registered` is the last element until the sort below, so the prefix is the existing set.
         ensure_surface_ownership(&registered, &entries[..entries.len() - 1])?;
         entries.sort_by(|left, right| left.id.cmp(&right.id));
         self.write_entries(&entries)?;
@@ -226,31 +130,55 @@ impl ExtensionRegistry {
         Ok(registered)
     }
 
-    /// Install or replace an extension manifest.
+    /// Install or replace an extension package.
     ///
     /// # Errors
     ///
-    /// Returns an error if the manifest cannot be loaded or registry state
+    /// Returns an error if the package cannot be loaded or registry state
     /// cannot be read or written.
-    pub fn install_manifest(
-        &self,
-        manifest_path: &Path,
-    ) -> Result<RegisteredExtension, SpindleError> {
-        self.register_manifest(manifest_path)
+    pub fn install_manifest(&self, input: &Path) -> Result<RegisteredExtension, SpindleError> {
+        let (source_package, source_manifest) = resolve_source_package(input)?;
+        let manifest = ExtensionManifest::from_path(&source_manifest)?;
+        ensure_static_surface(&manifest)?;
+        let staged = materialize_package(self.state_dir(), &source_package, &manifest)?;
+        let runtime_trust = RuntimeTrustSnapshot::for_staged(&staged, &manifest)?;
+        match self.record_staged_extension(&staged, &manifest, runtime_trust) {
+            Ok(registered) => Ok(registered),
+            Err(error) => {
+                remove_staged_package(&staged.package_root);
+                Err(error)
+            }
+        }
     }
 
-    /// Install or replace an extension manifest using an existing runtime host.
+    /// Install or replace an extension package using trusted runtime surface.
     ///
     /// # Errors
     ///
-    /// Returns an error if the manifest cannot be loaded or registry state
+    /// Returns an error if the package cannot be loaded or registry state
     /// cannot be read or written.
     pub fn install_manifest_with_runtime(
         &self,
-        manifest_path: &Path,
+        input: &Path,
         runtime: &ExtensionRuntimeHost,
     ) -> Result<RegisteredExtension, SpindleError> {
-        self.register_manifest_trusting_runtime(manifest_path, runtime)
+        let (source_package, source_manifest) = resolve_source_package(input)?;
+        let mut manifest = ExtensionManifest::from_path(&source_manifest)?;
+        let staged = materialize_package(self.state_dir(), &source_package, &manifest)?;
+        let snapshot = RuntimeTrustSnapshot::capture(&staged.package_root, &manifest)?;
+        let result = (|| -> Result<RegisteredExtension, SpindleError> {
+            manifest.apply_runtime_registration(&staged.package_root, runtime)?;
+            manifest.validate()?;
+            let runtime_trust = RuntimeTrustSnapshot::verify(snapshot, &manifest.id)?;
+            refresh_staged_manifest(&staged.package_root, &manifest)?;
+            let registered = self.record_staged_extension(&staged, &manifest, runtime_trust)?;
+            runtime.invalidate_extension(&registered.id);
+            Ok(registered)
+        })();
+        if result.is_err() {
+            remove_staged_package(&staged.package_root);
+        }
+        result
     }
 
     /// List registered extensions.
@@ -330,25 +258,34 @@ fn ensure_static_surface(manifest: &ExtensionManifest) -> Result<(), SpindleErro
 struct RuntimeTrustSnapshot {
     entrypoint_path: PathBuf,
     entrypoint_sha256: String,
-    registered_at_unix_ms: u64,
 }
 
 impl RuntimeTrustSnapshot {
-    fn for_manifest(
-        manifest_path: &Path,
+    fn capture(
+        package_root: &Path,
         manifest: &ExtensionManifest,
     ) -> Result<Option<Self>, SpindleError> {
         if manifest.runtime == ExtensionRuntime::Recipe {
             return Ok(None);
         }
-        let Some(entrypoint) = manifest.entrypoint.as_deref() else {
-            return Ok(None);
-        };
-        let entrypoint_path = crate::runtime::resolve_manifest_path(manifest_path, entrypoint);
+        let entrypoint_path = resolve_package_binary(package_root, &manifest.id);
         let entrypoint_path = fs::canonicalize(entrypoint_path)?;
         Ok(Some(Self {
             entrypoint_sha256: sha256_file(&entrypoint_path)?,
             entrypoint_path,
+        }))
+    }
+
+    fn for_staged(
+        staged: &StagedPackage,
+        manifest: &ExtensionManifest,
+    ) -> Result<Option<RegisteredRuntimeTrust>, SpindleError> {
+        let Some(snapshot) = Self::capture(&staged.package_root, manifest)? else {
+            return Ok(None);
+        };
+        Ok(Some(RegisteredRuntimeTrust {
+            entrypoint_sha256: snapshot.entrypoint_sha256,
+            entrypoint_path: snapshot.entrypoint_path,
             registered_at_unix_ms: crate::now_unix_ms()?,
         }))
     }
@@ -370,7 +307,7 @@ impl RuntimeTrustSnapshot {
         Ok(Some(RegisteredRuntimeTrust {
             entrypoint_path: snapshot.entrypoint_path,
             entrypoint_sha256: snapshot.entrypoint_sha256,
-            registered_at_unix_ms: snapshot.registered_at_unix_ms,
+            registered_at_unix_ms: crate::now_unix_ms()?,
         }))
     }
 }

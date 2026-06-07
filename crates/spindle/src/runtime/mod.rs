@@ -12,7 +12,7 @@ use spindle_extension_sdk::{
     ActionInvocation, ActionOutput, ExtensionRegistration, HostRequest, HostResponse,
 };
 
-pub use self::path::resolve_manifest_path;
+pub use self::path::resolve_package_binary;
 use self::stdio::StdioJsonlSession;
 use crate::{
     ExtensionManifest, ExtensionRuntime, RegisteredExtension, SpindleError, extension::sha256_file,
@@ -63,18 +63,23 @@ type StdioSessionMapGuard<'a> = MutexGuard<'a, StdioSessionMap>;
 struct StdioSessionKey {
     id: String,
     version: String,
-    manifest_path: PathBuf,
+    package_root: PathBuf,
     execution_path: PathBuf,
+    entrypoint_sha256: Option<String>,
 }
 
 impl StdioSessionKey {
-    fn from_extension(extension: &RegisteredExtension) -> Result<Self, SpindleError> {
-        Ok(Self {
+    fn from_extension(extension: &RegisteredExtension) -> Self {
+        Self {
             id: extension.id.clone(),
             version: extension.version.clone(),
-            manifest_path: extension.manifest_path.clone(),
-            execution_path: extension_execution_path(extension)?,
-        })
+            package_root: extension.package_root.clone(),
+            execution_path: extension_execution_path(extension),
+            entrypoint_sha256: extension
+                .runtime_trust
+                .as_ref()
+                .map(|trust| trust.entrypoint_sha256.clone()),
+        }
     }
 }
 
@@ -110,13 +115,12 @@ impl ExtensionRuntimeHost {
     pub fn load_registration(
         &self,
         manifest: &ExtensionManifest,
-        manifest_path: &Path,
+        package_root: &Path,
     ) -> Result<Option<ExtensionRegistration>, SpindleError> {
         match manifest.runtime {
             ExtensionRuntime::Recipe => Ok(None),
             ExtensionRuntime::StdioJsonl => {
-                let entrypoint = manifest_entrypoint(manifest)?;
-                let executable = resolve_manifest_path(manifest_path, entrypoint);
+                let executable = resolve_package_binary(package_root, &manifest.id);
                 let mut session = StdioJsonlSession::spawn(&manifest.id, &executable)?;
                 let response =
                     session.request(HostRequest::Register, self.inner.host_request_timeout)?;
@@ -143,7 +147,7 @@ impl ExtensionRuntimeHost {
             ExtensionRuntime::Recipe => Ok(ActionOutput::empty()),
             ExtensionRuntime::StdioJsonl => {
                 verify_runtime_trust(extension)?;
-                let session_key = StdioSessionKey::from_extension(extension)?;
+                let session_key = StdioSessionKey::from_extension(extension);
                 let session = self.stdio_session(extension, &session_key)?;
                 let response = {
                     let timeout = self.inner.host_request_timeout;
@@ -440,31 +444,9 @@ fn unexpected_host_response(extension: &str, response: &HostResponse) -> Spindle
     }
 }
 
-fn manifest_entrypoint(manifest: &ExtensionManifest) -> Result<&str, SpindleError> {
-    manifest
-        .entrypoint
-        .as_deref()
-        .ok_or(SpindleError::InvalidField {
-            field: "entrypoint",
-            reason: "is required unless runtime is recipe",
-        })
-}
-
-fn registered_entrypoint(extension: &RegisteredExtension) -> Result<&str, SpindleError> {
-    extension
-        .entrypoint
-        .as_deref()
-        .ok_or_else(|| SpindleError::MissingExtensionEntrypoint {
-            extension: extension.id.clone(),
-        })
-}
-
-fn extension_execution_path(extension: &RegisteredExtension) -> Result<PathBuf, SpindleError> {
+fn extension_execution_path(extension: &RegisteredExtension) -> PathBuf {
     if let Some(trust) = &extension.runtime_trust {
-        return Ok(trust.entrypoint_path.clone());
+        return trust.entrypoint_path.clone();
     }
-    Ok(resolve_manifest_path(
-        &extension.manifest_path,
-        registered_entrypoint(extension)?,
-    ))
+    resolve_package_binary(&extension.package_root, &extension.id)
 }
