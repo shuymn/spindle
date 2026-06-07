@@ -15,6 +15,9 @@
 - Before modifying tests, read `docs/testing.md`.
 - Before changing build, CI, hooks, toolchain, or adding tools, read `docs/tooling.md`.
 - Before code review work, read `docs/review.md`.
+- Before changing kernel/extension boundaries, read `docs/concepts.md`.
+- Before changing CLI behavior, state files, or policy behavior, read `docs/usage.md`.
+- Before changing extension manifests, routes, continuations, or stdio hosts, read `docs/extensions.md`.
 - Read `docs/adr/` only when historical rationale matters to the task.
 - `unwrap`, `expect`, `todo`, and `dbg!` are denied across the workspace, including tests.
   Prefer `Result` tests and `?`.
