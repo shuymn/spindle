@@ -1,20 +1,25 @@
 use std::{
     fs,
-    io::{BufRead, BufReader, BufWriter, Write},
+    io::{BufReader, BufWriter, Write},
     net::Shutdown,
     os::unix::{
-        fs::FileTypeExt,
+        fs::{FileTypeExt, PermissionsExt},
         net::{UnixListener, UnixStream},
     },
     path::Path,
-    sync::{Arc, Mutex},
+    sync::Arc,
     thread,
+    time::Duration,
 };
 
 use crate::{
     EventLog, ExtensionRegistry, ExtensionRuntimeHost, HubRequest, HubResponse, SpindleError,
     execute_request,
+    protocol::{DEFAULT_JSONL_MESSAGE_LIMIT, read_limited_jsonl_line},
+    store::ensure_private_parent,
 };
+
+const DEFAULT_STREAM_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Serve spindle JSONL requests on a Unix domain socket.
 ///
@@ -24,10 +29,11 @@ use crate::{
 pub fn serve(socket_path: &Path, log: &EventLog) -> Result<(), SpindleError> {
     prepare_socket(socket_path)?;
     let listener = UnixListener::bind(socket_path)?;
-    let state = ServerState::new(log.clone());
+    fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600))?;
+    let state = Arc::new(ServerState::new(log.clone()));
 
     for stream in listener.incoming() {
-        spawn_stream_handler(stream?, state.clone());
+        spawn_stream_handler(stream?, Arc::clone(&state));
     }
 
     Ok(())
@@ -40,22 +46,46 @@ pub fn serve(socket_path: &Path, log: &EventLog) -> Result<(), SpindleError> {
 /// Returns an error if the socket cannot be reached, the request cannot be
 /// serialized, or the response cannot be parsed.
 pub fn send_request(socket_path: &Path, request: &HubRequest) -> Result<HubResponse, SpindleError> {
+    send_request_inner(socket_path, request, None)
+}
+
+/// Send one request with read/write timeouts.
+///
+/// # Errors
+///
+/// Returns an error if the socket cannot be reached, the request cannot be
+/// serialized, the response cannot be parsed, or the timeout expires.
+pub fn send_request_with_timeout(
+    socket_path: &Path,
+    request: &HubRequest,
+    timeout: Duration,
+) -> Result<HubResponse, SpindleError> {
+    send_request_inner(socket_path, request, Some(timeout))
+}
+
+fn send_request_inner(
+    socket_path: &Path,
+    request: &HubRequest,
+    timeout: Option<Duration>,
+) -> Result<HubResponse, SpindleError> {
     let mut stream = UnixStream::connect(socket_path)?;
+    stream.set_read_timeout(timeout)?;
+    stream.set_write_timeout(timeout)?;
     serde_json::to_writer(&mut stream, request)?;
     writeln!(stream)?;
     stream.shutdown(Shutdown::Write)?;
 
     let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
+    let line = read_limited_jsonl_line(&mut reader, DEFAULT_JSONL_MESSAGE_LIMIT)?
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::UnexpectedEof))?;
     Ok(serde_json::from_str(&line)?)
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct ServerState {
     log: EventLog,
     registry: ExtensionRegistry,
-    runtime: Arc<Mutex<ExtensionRuntimeHost>>,
+    runtime: Arc<ExtensionRuntimeHost>,
 }
 
 impl ServerState {
@@ -63,41 +93,46 @@ impl ServerState {
         Self {
             registry: registry_for_log(&log),
             log,
-            runtime: Arc::new(Mutex::new(ExtensionRuntimeHost::new())),
+            runtime: Arc::new(ExtensionRuntimeHost::new()),
         }
     }
 
     fn execute(&self, request: HubRequest) -> Result<serde_json::Value, SpindleError> {
-        if !request_needs_runtime(&request) {
-            let mut runtime = ExtensionRuntimeHost::new();
-            return execute_request(request, &self.log, &self.registry, &mut runtime);
-        }
-
-        let mut runtime = self
-            .runtime
-            .lock()
-            .map_err(|_error| SpindleError::InvalidField {
-                field: "runtime",
-                reason: "lock poisoned",
-            })?;
-        execute_request(request, &self.log, &self.registry, &mut runtime)
+        execute_request(request, &self.log, &self.registry, &self.runtime)
     }
 }
 
-const fn request_needs_runtime(request: &HubRequest) -> bool {
-    matches!(
-        request,
-        HubRequest::Emit { .. } | HubRequest::Invoke { .. } | HubRequest::RegisterExtension { .. }
-    )
+fn handle_stream(stream: UnixStream, state: &ServerState) -> Result<(), SpindleError> {
+    handle_stream_with_timeout(stream, state, DEFAULT_STREAM_READ_IDLE_TIMEOUT)
 }
 
-fn handle_stream(stream: UnixStream, state: &ServerState) -> Result<(), SpindleError> {
+fn handle_stream_with_timeout(
+    stream: UnixStream,
+    state: &ServerState,
+    read_idle_timeout: Duration,
+) -> Result<(), SpindleError> {
+    stream.set_read_timeout(Some(read_idle_timeout))?;
     let reader_stream = stream.try_clone()?;
     let mut reader = BufReader::new(reader_stream);
     let mut writer = BufWriter::new(stream);
-    let mut line = String::new();
 
-    while reader.read_line(&mut line)? != 0 {
+    loop {
+        let line = match read_limited_jsonl_line(&mut reader, DEFAULT_JSONL_MESSAGE_LIMIT) {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(error) => {
+                let response = HubResponse::Error {
+                    error: error.to_string(),
+                };
+                serde_json::to_writer(&mut writer, &response)?;
+                writeln!(writer)?;
+                writer.flush()?;
+                break;
+            }
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
         let response = match serde_json::from_str::<HubRequest>(&line) {
             Ok(request) => HubResponse::from(state.execute(request)),
             Err(error) => HubResponse::Error {
@@ -107,13 +142,12 @@ fn handle_stream(stream: UnixStream, state: &ServerState) -> Result<(), SpindleE
         serde_json::to_writer(&mut writer, &response)?;
         writeln!(writer)?;
         writer.flush()?;
-        line.clear();
     }
 
     Ok(())
 }
 
-fn spawn_stream_handler(stream: UnixStream, state: ServerState) {
+fn spawn_stream_handler(stream: UnixStream, state: Arc<ServerState>) {
     let _handler = thread::spawn(move || {
         let _result = handle_stream(stream, &state);
     });
@@ -124,9 +158,20 @@ fn registry_for_log(log: &EventLog) -> ExtensionRegistry {
 }
 
 fn prepare_socket(socket_path: &Path) -> Result<(), SpindleError> {
-    if let Some(parent) = socket_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    let Some(_parent) = socket_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return Err(SpindleError::InvalidField {
+            field: "socket",
+            reason: "socket path must have a parent directory",
+        });
+    };
+    ensure_private_parent(
+        socket_path,
+        "socket",
+        "socket parent directory must be private",
+    )?;
 
     if !socket_path.exists() {
         return Ok(());
@@ -152,7 +197,7 @@ fn prepare_socket(socket_path: &Path) -> Result<(), SpindleError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, thread};
+    use std::{fs, io::Read, os::unix::fs::PermissionsExt, thread};
 
     use serde_json::json;
 
@@ -160,31 +205,72 @@ mod tests {
     use crate::{EventFilter, HubRequest};
 
     #[test]
-    fn request_runtime_need_is_limited_to_dispatch_and_registration() {
-        assert!(request_needs_runtime(&HubRequest::Emit {
-            kind: String::from("test.changed"),
-            source: String::from("unit"),
-            subject: None,
-            data: json!({})
-        }));
-        assert!(request_needs_runtime(&HubRequest::Invoke {
-            action: String::from("test.render"),
-            source: String::from("unit"),
-            capabilities: Vec::new(),
-            args: json!({})
-        }));
-        assert!(request_needs_runtime(&HubRequest::RegisterExtension {
-            manifest: "extension.json".into()
-        }));
-        assert!(!request_needs_runtime(&HubRequest::QueryEvents {
-            kind: None,
-            source: None,
-            limit: None
-        }));
-        assert!(!request_needs_runtime(&HubRequest::ValidateExtension {
-            manifest: "extension.json".into()
-        }));
-        assert!(!request_needs_runtime(&HubRequest::ListExtensions));
+    fn prepare_socket_does_not_chmod_existing_parent_directory() -> Result<(), SpindleError> {
+        let dir = crate::store::tests_support::test_dir()?;
+        fs::create_dir_all(&dir)?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500))?;
+
+        prepare_socket(&dir.join("spindle.sock"))?;
+
+        assert_eq!(fs::metadata(&dir)?.permissions().mode() & 0o777, 0o500);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn prepare_socket_rejects_public_existing_parent_directory() -> Result<(), SpindleError> {
+        let dir = crate::store::tests_support::test_dir()?;
+        fs::create_dir_all(&dir)?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755))?;
+
+        let result = prepare_socket(&dir.join("spindle.sock"));
+
+        assert!(matches!(
+            result,
+            Err(SpindleError::InvalidField {
+                field: "socket",
+                ..
+            })
+        ));
+        assert_eq!(fs::metadata(&dir)?.permissions().mode() & 0o777, 0o755);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn prepare_socket_rejects_parent_path_that_is_not_directory() -> Result<(), SpindleError> {
+        let dir = crate::store::tests_support::test_dir()?;
+        let parent_file = dir.join("not-a-directory");
+        fs::write(&parent_file, b"not a directory")?;
+
+        let result = prepare_socket(&parent_file.join("spindle.sock"));
+
+        assert!(matches!(
+            result,
+            Err(SpindleError::InvalidField {
+                field: "socket",
+                reason: "parent path must be a directory",
+            })
+        ));
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn prepare_socket_creates_missing_parent_private() -> Result<(), SpindleError> {
+        let dir = crate::store::tests_support::test_dir()?;
+        let socket_parent = dir.join("state");
+
+        prepare_socket(&socket_parent.join("spindle.sock"))?;
+
+        assert_eq!(
+            fs::metadata(&socket_parent)?.permissions().mode() & 0o777,
+            0o700
+        );
+        fs::remove_dir_all(dir)?;
+        Ok(())
     }
 
     #[test]
@@ -193,6 +279,10 @@ mod tests {
         fs::create_dir_all(&dir)?;
         let socket = dir.join("spindle.sock");
         let log = EventLog::in_dir(&dir);
+        crate::store::tests_support::write_capability_policy(
+            &dir,
+            r#"{"emits":{"pi":["agent.status.changed"]},"direct":{},"routes":{}}"#,
+        )?;
         let server_state = ServerState::new(log.clone());
         let listener = UnixListener::bind(&socket)?;
 
@@ -226,12 +316,151 @@ mod tests {
     }
 
     #[test]
+    fn server_rejects_non_utf8_request() -> Result<(), SpindleError> {
+        let dir = crate::store::tests_support::test_dir()?;
+        fs::create_dir_all(&dir)?;
+        let state = ServerState::new(EventLog::in_dir(&dir));
+        let (mut client, server) = UnixStream::pair()?;
+        let handle = thread::spawn(move || handle_stream(server, &state));
+
+        client.write_all(b"{\"command\":\"list-extensions\",\"bad\":\"")?;
+        client.write_all(&[0xff, b'"', b'}', b'\n'])?;
+        client.shutdown(Shutdown::Write)?;
+
+        let mut reader = std::io::BufReader::new(&mut client);
+        let response = read_response_line(&mut reader)?;
+        let parsed = serde_json::from_str::<HubResponse>(&response)?;
+        assert!(matches!(parsed, HubResponse::Error { .. }));
+        handle
+            .join()
+            .map_err(|_payload| SpindleError::InvalidField {
+                field: "server_thread",
+                reason: "panicked",
+            })??;
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_request_returns_one_error_then_closes() -> Result<(), SpindleError> {
+        let dir = crate::store::tests_support::test_dir()?;
+        fs::create_dir_all(&dir)?;
+        let state = ServerState::new(EventLog::in_dir(&dir));
+        let (mut client, server) = UnixStream::pair()?;
+        let handle = thread::spawn(move || handle_stream(server, &state));
+
+        client.write_all(&vec![b'a'; DEFAULT_JSONL_MESSAGE_LIMIT + 1])?;
+        client.write_all(b"\n")?;
+        client.shutdown(Shutdown::Write)?;
+
+        let mut reader = std::io::BufReader::new(&mut client);
+        let response = read_response_line(&mut reader)?;
+        let parsed = serde_json::from_str::<HubResponse>(&response)?;
+        assert!(matches!(parsed, HubResponse::Error { .. }));
+        let mut trailing = String::new();
+        reader.read_to_string(&mut trailing)?;
+        assert!(trailing.is_empty());
+        handle
+            .join()
+            .map_err(|_payload| SpindleError::InvalidField {
+                field: "server_thread",
+                reason: "panicked",
+            })??;
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_json_response_keeps_connection_alive() -> Result<(), SpindleError> {
+        let dir = crate::store::tests_support::test_dir()?;
+        fs::create_dir_all(&dir)?;
+        let state = ServerState::new(EventLog::in_dir(&dir));
+        let (mut client, server) = UnixStream::pair()?;
+        let handle = thread::spawn(move || handle_stream(server, &state));
+
+        client.write_all(b"{not-json}\n")?;
+        client.write_all(b"{\"command\":\"list-extensions\"}\n")?;
+        client.shutdown(Shutdown::Write)?;
+
+        let mut reader = std::io::BufReader::new(&mut client);
+        let first = serde_json::from_str::<HubResponse>(&read_response_line(&mut reader)?)?;
+        let second = serde_json::from_str::<HubResponse>(&read_response_line(&mut reader)?)?;
+        assert!(matches!(first, HubResponse::Error { .. }));
+        assert!(matches!(second, HubResponse::Ok { .. }));
+        handle
+            .join()
+            .map_err(|_payload| SpindleError::InvalidField {
+                field: "server_thread",
+                reason: "panicked",
+            })??;
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    fn read_response_line(reader: &mut impl std::io::BufRead) -> Result<String, SpindleError> {
+        read_limited_jsonl_line(reader, DEFAULT_JSONL_MESSAGE_LIMIT)?
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into())
+    }
+
+    #[test]
+    fn partial_request_returns_protocol_error() -> Result<(), SpindleError> {
+        let dir = crate::store::tests_support::test_dir()?;
+        fs::create_dir_all(&dir)?;
+        let state = ServerState::new(EventLog::in_dir(&dir));
+        let (mut client, server) = UnixStream::pair()?;
+        let handle = thread::spawn(move || handle_stream(server, &state));
+
+        client.write_all(b"{\"command\":\"list-extensions\"")?;
+        client.shutdown(Shutdown::Write)?;
+
+        let mut reader = std::io::BufReader::new(&mut client);
+        let response = read_response_line(&mut reader)?;
+        let parsed = serde_json::from_str::<HubResponse>(&response)?;
+        assert!(matches!(parsed, HubResponse::Error { .. }));
+        handle
+            .join()
+            .map_err(|_payload| SpindleError::InvalidField {
+                field: "server_thread",
+                reason: "panicked",
+            })??;
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn live_partial_peer_times_out_with_protocol_error() -> Result<(), SpindleError> {
+        let dir = crate::store::tests_support::test_dir()?;
+        fs::create_dir_all(&dir)?;
+        let state = ServerState::new(EventLog::in_dir(&dir));
+        let (mut client, server) = UnixStream::pair()?;
+        let handle = thread::spawn(move || {
+            handle_stream_with_timeout(server, &state, Duration::from_millis(50))
+        });
+
+        client.write_all(b"{\"command\":\"list-extensions\"")?;
+        client.flush()?;
+
+        let mut reader = std::io::BufReader::new(&mut client);
+        let response = read_response_line(&mut reader)?;
+        let parsed = serde_json::from_str::<HubResponse>(&response)?;
+        assert!(matches!(parsed, HubResponse::Error { .. }));
+        handle
+            .join()
+            .map_err(|_payload| SpindleError::InvalidField {
+                field: "server_thread",
+                reason: "panicked",
+            })??;
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn daemon_reuses_stdio_hosts_across_client_connections() -> Result<(), SpindleError> {
         let dir = crate::store::tests_support::test_dir()?;
         fs::create_dir_all(&dir)?;
         crate::store::tests_support::write_capability_policy(
             &dir,
-            r#"{"direct":{"test-client":["test.write"]},"routes":{}}"#,
+            r#"{"emits":{},"direct":{"test-client":["test.write"]},"routes":{}}"#,
         )?;
         let host = dir.join("host.sh");
         crate::store::tests_support::write_executable(
@@ -241,7 +470,7 @@ count=0
 while IFS= read -r line; do
   case "$line" in
     *'"type":"register"'*)
-      printf '%s\n' '{"type":"registration","registration":{"capabilities":["test.write"],"actions":{"test.render":{"capabilities":["test.write"]}}}}'
+      printf '%s\n' '{"type":"registration","registration":{"produces":["test.rendered"],"capabilities":["test.write"],"actions":{"test.render":{"capabilities":["test.write"]}}}}'
       ;;
     *'"type":"invoke"'*)
       count=$((count + 1))
@@ -281,7 +510,13 @@ done
         });
 
         assert!(matches!(
-            send_request(&socket, &HubRequest::RegisterExtension { manifest })?,
+            send_request(
+                &socket,
+                &HubRequest::RegisterExtension {
+                    manifest,
+                    trust_runtime: true,
+                },
+            )?,
             HubResponse::Ok { .. }
         ));
         let first = send_request(

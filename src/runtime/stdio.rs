@@ -1,11 +1,8 @@
 use std::{
-    io::{BufRead, BufReader, BufWriter, Write},
+    io::{BufReader, BufWriter, Write},
     path::Path,
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
-    sync::{
-        Arc, Mutex,
-        mpsc::{self, RecvTimeoutError, Sender},
-    },
+    sync::mpsc::{self, RecvTimeoutError, Sender},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -14,13 +11,14 @@ use spindle_extension_sdk::{HostRequest, HostResponse};
 
 use crate::{
     SpindleError,
-    runtime::{resolve_manifest_path, timeout_millis, unexpected_host_response},
+    protocol::{DEFAULT_JSONL_MESSAGE_LIMIT, read_limited_jsonl_line},
+    runtime::{timeout_millis, unexpected_host_response},
 };
 
 #[derive(Debug)]
 pub(super) struct StdioJsonlSession {
     extension: String,
-    child: Arc<Mutex<Child>>,
+    child: Child,
     requests: Option<Sender<StdioJsonlWorkerRequest>>,
     worker: Option<JoinHandle<()>>,
 }
@@ -39,12 +37,8 @@ struct StdioJsonlWorker {
 }
 
 impl StdioJsonlSession {
-    pub(super) fn spawn(
-        extension: &str,
-        manifest_path: &Path,
-        entrypoint: &str,
-    ) -> Result<Self, SpindleError> {
-        let mut child = Command::new(resolve_manifest_path(manifest_path, entrypoint))
+    pub(super) fn spawn(extension: &str, executable: &Path) -> Result<Self, SpindleError> {
+        let mut child = Command::new(executable)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -62,7 +56,6 @@ impl StdioJsonlSession {
                 extension: String::from(extension),
             })?;
 
-        let child = Arc::new(Mutex::new(child));
         let (requests, worker_requests) = mpsc::channel::<StdioJsonlWorkerRequest>();
         let worker = StdioJsonlWorker {
             extension: String::from(extension),
@@ -81,7 +74,7 @@ impl StdioJsonlSession {
 
     pub(super) fn request(
         &mut self,
-        request: &HostRequest,
+        request: HostRequest,
         timeout: Duration,
     ) -> Result<HostResponse, SpindleError> {
         let Some(requests) = &self.requests else {
@@ -92,7 +85,7 @@ impl StdioJsonlSession {
         let (response_sender, response_receiver) = mpsc::channel();
         requests
             .send(StdioJsonlWorkerRequest {
-                request: request.clone(),
+                request,
                 response: response_sender,
             })
             .map_err(|_send_error| SpindleError::ExtensionHostClosed {
@@ -115,7 +108,7 @@ impl StdioJsonlSession {
     }
 
     pub(super) fn shutdown(&mut self, timeout: Duration) -> Result<(), SpindleError> {
-        match self.request(&HostRequest::Shutdown, timeout)? {
+        match self.request(HostRequest::Shutdown, timeout)? {
             HostResponse::Shutdown => {
                 self.join_worker();
                 self.wait_for_child_exit_or_kill(timeout)?;
@@ -127,9 +120,8 @@ impl StdioJsonlSession {
 
     pub(super) fn terminate(&mut self) {
         self.requests.take();
-        if let Ok(mut child) = self.child.lock() {
-            let _result = child.kill();
-        }
+        let _result = self.child.kill();
+        let _result = self.child.wait();
         self.join_worker();
     }
 
@@ -140,31 +132,26 @@ impl StdioJsonlSession {
         }
     }
 
-    fn wait_for_child_exit_or_kill(&self, timeout: Duration) -> Result<(), SpindleError> {
+    fn wait_for_child_exit_or_kill(&mut self, timeout: Duration) -> Result<(), SpindleError> {
         let started = Instant::now();
 
         loop {
-            {
-                let mut child =
-                    self.child
-                        .lock()
-                        .map_err(|_error| SpindleError::ExtensionHostClosed {
-                            extension: self.extension.clone(),
-                        })?;
-                if child.try_wait()?.is_some() {
-                    drop(child);
-                    return Ok(());
-                }
-                if started.elapsed() >= timeout {
-                    let _result = child.kill();
-                    let _result = child.wait();
-                    drop(child);
-                    return Ok(());
-                }
-                drop(child);
+            if self.child.try_wait()?.is_some() {
+                return Ok(());
+            }
+            if started.elapsed() >= timeout {
+                let _result = self.child.kill();
+                let _result = self.child.wait();
+                return Ok(());
             }
             thread::sleep(Duration::from_millis(10));
         }
+    }
+}
+
+impl Drop for StdioJsonlSession {
+    fn drop(&mut self) {
+        self.terminate();
     }
 }
 
@@ -185,12 +172,10 @@ impl StdioJsonlWorker {
         writeln!(self.stdin)?;
         self.stdin.flush()?;
 
-        let mut line = String::new();
-        if self.stdout.read_line(&mut line)? == 0 {
-            return Err(SpindleError::ExtensionHostClosed {
+        let line = read_limited_jsonl_line(&mut self.stdout, DEFAULT_JSONL_MESSAGE_LIMIT)?
+            .ok_or_else(|| SpindleError::ExtensionHostClosed {
                 extension: self.extension.clone(),
-            });
-        }
+            })?;
         serde_json::from_str::<HostResponse>(&line).map_err(|source| {
             SpindleError::ExtensionHostProtocolInvalid {
                 extension: self.extension.clone(),

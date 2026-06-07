@@ -1,6 +1,6 @@
 use std::path::{Component, Path, PathBuf};
 
-pub(super) fn resolve_manifest_path(manifest_path: &Path, entrypoint: &str) -> PathBuf {
+pub fn resolve_manifest_path(manifest_path: &Path, entrypoint: &str) -> PathBuf {
     let path = PathBuf::from(entrypoint);
     if path.is_absolute() {
         path
