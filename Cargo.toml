@@ -2,18 +2,39 @@
 name = "spindle"
 version = "0.1.0"
 edition = "2024"
-description = "Personal Rust template (bin-first, Task, opinionated rustfmt + clippy)."
+description = "Self-extensible local automation harness for macOS workflows."
 license = "MIT"
 repository = "https://github.com/shuymn/spindle"
-keywords = ["template"]
-categories = ["development-tools"]
+keywords = ["automation", "macos", "agent", "cli"]
+categories = ["command-line-utilities", "development-tools"]
 
-[dependencies]
+[workspace]
+members = [
+    ".",
+    "crates/spindle-extension-sdk",
+    "extensions/aerospace",
+    "extensions/sketchybar",
+    "extensions/workspace-indicator",
+]
+resolver = "3"
+
+[workspace.dependencies]
 anyhow = "1.0.102"
+cc = "1.2.49"
 clap = { version = "4.6.1", features = ["derive"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+spindle-extension-sdk = { path = "crates/spindle-extension-sdk" }
+tempfile = "3.23.0"
 thiserror = "2.0.18"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+spindle-extension-sdk = { workspace = true }
+thiserror = { workspace = true }
 
 [lints.rust]
 unsafe_code = "forbid"

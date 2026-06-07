@@ -2,6 +2,6 @@
 #![warn(clippy::nursery)]
 #![warn(clippy::cargo)]
 
-fn main() {
-    println!("Hello, world!");
+fn main() -> anyhow::Result<()> {
+    spindle::cli::run()
 }

@@ -1,0 +1,6 @@
+{
+  "id": "workspace-indicator",
+  "version": "0.1.0",
+  "entrypoint": "../../target/release/spindle-workspace-indicator",
+  "runtime": "stdio-jsonl"
+}

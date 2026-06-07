@@ -1,0 +1,33 @@
+[package]
+name = "spindle-extension-sdk"
+version = "0.1.0"
+edition = "2024"
+description = "Typed stdio extension-host contract for spindle."
+license = "MIT"
+repository = "https://github.com/shuymn/spindle"
+readme = "README.md"
+keywords = ["spindle", "extension", "automation"]
+categories = ["development-tools"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[lints.clippy]
+dbg_macro = "deny"
+expect_used = "deny"
+infinite_loop = "deny"
+map_err_ignore = "deny"
+panic = "deny"
+str_to_string = "deny"
+implicit_clone = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"

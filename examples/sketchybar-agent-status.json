@@ -1,0 +1,18 @@
+{
+  "id": "sketchybar-agent-status",
+  "version": "0.1.0",
+  "runtime": "recipe",
+  "capabilities": ["sketchybar.ui.write"],
+  "actions": {
+    "sketchybar.agentStatus.render": {
+      "capabilities": ["sketchybar.ui.write"]
+    }
+  },
+  "routes": [
+    {
+      "event": "agent.status.changed",
+      "action": "sketchybar.agentStatus.render",
+      "capabilities": ["sketchybar.ui.write"]
+    }
+  ]
+}

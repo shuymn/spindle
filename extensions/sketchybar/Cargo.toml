@@ -1,0 +1,46 @@
+[package]
+name = "spindle-sketchybar-extension"
+version = "0.1.0"
+edition = "2024"
+description = "SketchyBar capability extension for spindle."
+license = "MIT"
+repository = "https://github.com/shuymn/spindle"
+readme = "README.md"
+keywords = ["sketchybar", "macos", "spindle", "automation"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "spindle-sketchybar"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+spindle-extension-sdk = { workspace = true }
+thiserror = { workspace = true }
+
+[build-dependencies]
+cc = { workspace = true }
+
+[lints.rust]
+# SketchyBar UI updates are latency-sensitive. This crate uses a tiny, isolated
+# Mach IPC FFI bridge instead of spawning the `sketchybar` CLI for each message.
+# Keep all Rust unsafe confined to that bridge module.
+unsafe_code = "deny"
+unused_must_use = "deny"
+
+[lints.clippy]
+dbg_macro = "deny"
+expect_used = "deny"
+infinite_loop = "deny"
+map_err_ignore = "deny"
+panic = "deny"
+str_to_string = "deny"
+implicit_clone = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"

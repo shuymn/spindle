@@ -1,0 +1,43 @@
+[package]
+name = "spindle-aerospace-extension"
+version = "0.1.0"
+edition = "2024"
+description = "AeroSpace capability extension for spindle."
+license = "MIT"
+repository = "https://github.com/shuymn/spindle"
+readme = "README.md"
+keywords = ["aerospace", "macos", "spindle", "automation"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "spindle-aerospace"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+spindle-extension-sdk = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[lints.clippy]
+dbg_macro = "deny"
+expect_used = "deny"
+infinite_loop = "deny"
+map_err_ignore = "deny"
+panic = "deny"
+str_to_string = "deny"
+implicit_clone = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"

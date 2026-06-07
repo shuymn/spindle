@@ -1,0 +1,6 @@
+{
+  "id": "sketchybar",
+  "version": "0.1.0",
+  "entrypoint": "../../target/release/spindle-sketchybar",
+  "runtime": "stdio-jsonl"
+}
