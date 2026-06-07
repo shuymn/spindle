@@ -49,6 +49,7 @@ impl<E: Display> Display for ActionRouterError<E> {
 
 /// JSONL request accepted by a stdio extension host.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum HostRequest {
     /// Return this extension's registered surface.
@@ -56,7 +57,7 @@ pub enum HostRequest {
     /// Invoke one installed action.
     Invoke {
         /// Action invocation supplied by spindle.
-        invocation: Box<ActionInvocation>,
+        invocation: ActionInvocation,
     },
     /// Ask the extension host to terminate cleanly.
     Shutdown,
@@ -122,7 +123,7 @@ where
                 registration: registration.clone(),
             },
             HostRequest::Invoke { invocation } => {
-                let context = ActionContext::from_invocation(*invocation);
+                let context = ActionContext::from_invocation(invocation);
                 match handler(&context) {
                     Ok(output) => HostResponse::ActionOutput { output },
                     Err(error) => HostResponse::Error {

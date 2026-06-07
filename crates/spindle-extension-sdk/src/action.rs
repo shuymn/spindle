@@ -112,8 +112,6 @@ pub struct ActionOutputEvent {
     /// Event type.
     #[serde(rename = "type")]
     pub kind: String,
-    /// Event source.
-    pub source: String,
     /// Optional event subject.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
@@ -125,10 +123,9 @@ pub struct ActionOutputEvent {
 impl ActionOutputEvent {
     /// Create an output event with empty object data.
     #[must_use]
-    pub fn new(kind: impl Into<String>, source: impl Into<String>) -> Self {
+    pub fn new(kind: impl Into<String>) -> Self {
         Self {
             kind: kind.into(),
-            source: source.into(),
             subject: None,
             data: empty_object(),
         }

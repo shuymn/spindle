@@ -12,6 +12,9 @@ pub struct ExtensionRegistration {
     /// Event types this extension can emit.
     #[serde(default)]
     pub emits: Vec<String>,
+    /// Event types this extension's actions can produce.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub produces: Vec<String>,
     /// Capabilities declared by this extension.
     #[serde(default)]
     pub capabilities: Vec<String>,
@@ -37,6 +40,13 @@ impl ExtensionRegistration {
         self
     }
 
+    /// Register an action-produced event type.
+    #[must_use]
+    pub fn produce(mut self, event: impl Into<String>) -> Self {
+        self.produces.push(event.into());
+        self
+    }
+
     /// Register a capability.
     #[must_use]
     pub fn capability(mut self, capability: impl Into<String>) -> Self {
@@ -58,7 +68,9 @@ impl ExtensionRegistration {
         self
     }
 
-    /// Register an event handler action and route it from an event.
+    /// Register a capless event handler action and route it from an event.
+    ///
+    /// Use [`Self::on_from`] when the handler action requires capabilities.
     #[must_use]
     pub fn on(
         self,
@@ -74,7 +86,29 @@ impl ExtensionRegistration {
         )
     }
 
-    /// Register an event handler action with static route arguments.
+    /// Register an event handler action for a specific event source.
+    ///
+    /// Action capabilities are copied to the generated source-bound route.
+    #[must_use]
+    pub fn on_from(
+        self,
+        source: impl Into<String>,
+        event: impl Into<String>,
+        action_name: impl Into<String>,
+        action: RegistrationAction,
+    ) -> Self {
+        let action_name = action_name.into();
+        self.on_capability_route(
+            RegistrationRoute::new(event, action_name.clone()).source(source),
+            action_name,
+            action,
+        )
+    }
+
+    /// Register a capless event handler action with static route arguments.
+    ///
+    /// Use [`Self::on_with_args_from`] when the handler action requires
+    /// capabilities.
     #[must_use]
     pub fn on_with_args(
         self,
@@ -91,16 +125,50 @@ impl ExtensionRegistration {
         )
     }
 
+    /// Register an event handler action for a specific source with static route arguments.
+    ///
+    /// Action capabilities are copied to the generated source-bound route.
+    #[must_use]
+    pub fn on_with_args_from(
+        self,
+        source_event: (impl Into<String>, impl Into<String>),
+        action_name: impl Into<String>,
+        action: RegistrationAction,
+        args: Value,
+    ) -> Self {
+        let (source, event) = source_event;
+        let action_name = action_name.into();
+        self.on_capability_route(
+            RegistrationRoute::new(event, action_name.clone())
+                .source(source)
+                .with_args(args),
+            action_name,
+            action,
+        )
+    }
+
     fn on_route(
         mut self,
         route: RegistrationRoute,
         action_name: String,
         action: RegistrationAction,
     ) -> Self {
-        let route = route_with_action_capabilities(route, &action);
         self.actions.insert(action_name, action);
         self.routes.push(route);
         self
+    }
+
+    fn on_capability_route(
+        self,
+        route: RegistrationRoute,
+        action_name: String,
+        action: RegistrationAction,
+    ) -> Self {
+        self.on_route(
+            route_with_action_capabilities(route, &action),
+            action_name,
+            action,
+        )
     }
 
     /// Serialize this registration as JSON.
@@ -137,7 +205,7 @@ impl RegistrationAction {
     /// Require a capability for this action.
     #[must_use]
     pub fn capability(mut self, capability: impl Into<String>) -> Self {
-        self.capabilities.push(capability.into());
+        push_unique(&mut self.capabilities, capability.into());
         self
     }
 }
@@ -148,6 +216,9 @@ impl RegistrationAction {
 pub struct RegistrationRoute {
     /// Event type that activates this route.
     pub event: String,
+    /// Event source that activates this route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     /// Action requested when the event is observed.
     pub action: String,
     /// Capabilities granted by this installed route.
@@ -164,16 +235,24 @@ impl RegistrationRoute {
     pub fn new(event: impl Into<String>, action: impl Into<String>) -> Self {
         Self {
             event: event.into(),
+            source: None,
             action: action.into(),
             capabilities: Vec::new(),
             args: empty_object(),
         }
     }
 
+    /// Match this route only when the source also matches.
+    #[must_use]
+    pub fn source(mut self, source: impl Into<String>) -> Self {
+        self.source = Some(source.into());
+        self
+    }
+
     /// Grant a capability when this route invokes its action.
     #[must_use]
     pub fn capability(mut self, capability: impl Into<String>) -> Self {
-        self.capabilities.push(capability.into());
+        push_unique(&mut self.capabilities, capability.into());
         self
     }
 
@@ -185,12 +264,18 @@ impl RegistrationRoute {
     }
 }
 
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !values.contains(&value) {
+        values.push(value);
+    }
+}
+
 fn route_with_action_capabilities(
     mut route: RegistrationRoute,
     action: &RegistrationAction,
 ) -> RegistrationRoute {
-    route
-        .capabilities
-        .extend(action.capabilities.iter().cloned());
+    for capability in &action.capabilities {
+        push_unique(&mut route.capabilities, capability.clone());
+    }
     route
 }
