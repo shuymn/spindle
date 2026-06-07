@@ -324,6 +324,9 @@ fn resolve_install_manifest(extension: &std::path::Path) -> PathBuf {
 mod tests {
     use std::fs;
 
+    use spindle_extension_sdk::{ExtensionRegistration, RegistrationAction};
+    use spindle_test_host::TestHostConfig;
+
     use super::*;
 
     #[test]
@@ -350,22 +353,13 @@ mod tests {
     fn surface_trust_runtime_does_not_write_registry() -> Result<()> {
         let dir = crate::store::tests_support::test_dir()?;
         fs::create_dir_all(&dir)?;
-        let host = dir.join("host.sh");
-        crate::store::tests_support::write_executable(
-            &host,
-            r#"#!/bin/sh
-while IFS= read -r line; do
-  case "$line" in
-    *'"type":"register"'*)
-      printf '%s\n' '{"type":"registration","registration":{"produces":["test.rendered"],"actions":{"test.render":{"capabilities":[]}}}}'
-      ;;
-    *'"type":"shutdown"'*)
-      printf '%s\n' '{"type":"shutdown"}'
-      exit 0
-      ;;
-  esac
-done
-"#,
+        let registration = ExtensionRegistration::new()
+            .produce("test.rendered")
+            .action("test.render", RegistrationAction::new());
+        let host = crate::store::tests_support::install_test_host(
+            &dir,
+            "host",
+            &TestHostConfig::with_registration(registration),
         )?;
         let manifest = dir.join("extension.json");
         fs::write(

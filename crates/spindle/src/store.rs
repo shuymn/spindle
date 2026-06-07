@@ -432,4 +432,66 @@ pub mod tests_support {
         fs::write(state_dir.join("capabilities.json"), contents)?;
         Ok(())
     }
+
+    /// Copy the `spindle-test-host` binary into `dir` and write its JSON config.
+    ///
+    /// The returned path is suitable for use as a stdio JSONL manifest entrypoint.
+    fn test_host_source() -> Result<PathBuf, SpindleError> {
+        if let Ok(path) = std::env::var("CARGO_BIN_EXE_spindle-test-host") {
+            return Ok(PathBuf::from(path));
+        }
+
+        let profile = std::env::var("PROFILE").unwrap_or_else(|_error| String::from("debug"));
+        let candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("target")
+            .join(profile)
+            .join("spindle-test-host");
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+
+        Err(SpindleError::InvalidField {
+            field: "test_host",
+            reason: "spindle-test-host binary is missing; run cargo build -p spindle-test-host",
+        })
+    }
+
+    pub fn test_host_with_write_render(
+        dir: &std::path::Path,
+        name: &str,
+    ) -> Result<PathBuf, SpindleError> {
+        use spindle_extension_sdk::{ExtensionRegistration, RegistrationAction};
+        use spindle_test_host::TestHostConfig;
+
+        let registration = ExtensionRegistration::new()
+            .capability("test.write")
+            .action(
+                "test.render",
+                RegistrationAction::new().capability("test.write"),
+            );
+        install_test_host(dir, name, &TestHostConfig::with_registration(registration))
+    }
+
+    pub fn install_test_host(
+        dir: &std::path::Path,
+        name: &str,
+        config: &spindle_test_host::TestHostConfig,
+    ) -> Result<PathBuf, SpindleError> {
+        let host = dir.join(name);
+        let source = test_host_source()?;
+        fs::copy(&source, &host)?;
+        let mut permissions = fs::metadata(&host)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&host, permissions)?;
+        let config_json = serde_json::to_string(config)?;
+        fs::write(host.with_extension("json"), &config_json)?;
+        if let Ok(canonical) = fs::canonicalize(&host) {
+            let canonical_config = canonical.with_extension("json");
+            if canonical_config != host.with_extension("json") {
+                fs::write(canonical_config, &config_json)?;
+            }
+        }
+        Ok(host)
+    }
 }

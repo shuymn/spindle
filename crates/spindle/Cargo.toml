@@ -9,6 +9,9 @@ readme = "../../README.md"
 keywords = ["automation", "macos", "agent", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 
+[dev-dependencies]
+spindle-test-host = { path = "../spindle-test-host" }
+
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }

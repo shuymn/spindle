@@ -1,0 +1,20 @@
+[package]
+name = "spindle-extension-example"
+version = "0.1.0"
+edition.workspace = true
+description = "Minimal spindle stdio JSONL extension example."
+license = "MIT"
+repository = "https://github.com/shuymn/spindle"
+publish = false
+
+[[bin]]
+name = "spindle-extension-example"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+spindle-extension-sdk = { workspace = true }
+
+[lints]
+workspace = true

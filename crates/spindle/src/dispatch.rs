@@ -445,7 +445,8 @@ mod tests {
     use std::{fs, path::PathBuf};
 
     use serde_json::json;
-    use spindle_extension_sdk::ActionOutput;
+    use spindle_extension_sdk::{ActionOutput, ExtensionRegistration, RegistrationAction};
+    use spindle_test_host::{InvokeEffect, InvokeRule, ResponseTemplate, TestHostConfig};
 
     use super::*;
 
@@ -512,33 +513,46 @@ mod tests {
             &dir,
             r#"{"emits":{"unit":["test.initial"]},"direct":{},"routes":{"test-recipe":[{"source":"unit","event":"test.initial","capabilities":["test.write"]},{"source":"test-host","event":"test.followup","capabilities":["test.write"]}]}}"#,
         )?;
-        let host = dir.join("snapshot-host.sh");
-        crate::store::tests_support::write_executable(
-            &host,
-            &format!(
-                r#"#!/bin/sh
-policy_path='{}'
-while IFS= read -r line; do
-  case "$line" in
-    *'"type":"register"'*)
-      printf '%s\n' '{{"type":"registration","registration":{{"produces":["test.followup"],"capabilities":["test.write"],"actions":{{"test.start":{{"capabilities":["test.write"]}},"test.finish":{{"capabilities":["test.write"]}}}}}}}}'
-      ;;
-    *'"action":"test.start"'*)
-      rm -f "$policy_path"
-      printf '%s\n' '{{"type":"action-output","output":{{"events":[{{"type":"test.followup","source":"test-host","data":{{}}}}]}}}}'
-      ;;
-    *'"action":"test.finish"'*)
-      printf '%s\n' '{{"type":"action-output","output":{{}}}}'
-      ;;
-    *'"type":"shutdown"'*)
-      printf '%s\n' '{{"type":"shutdown"}}'
-      exit 0
-      ;;
-  esac
-done
-"#,
-                policy_path.display()
-            ),
+        let registration = ExtensionRegistration::new()
+            .produce("test.followup")
+            .capability("test.write")
+            .action(
+                "test.start",
+                RegistrationAction::new().capability("test.write"),
+            )
+            .action(
+                "test.finish",
+                RegistrationAction::new().capability("test.write"),
+            );
+        let host = crate::store::tests_support::install_test_host(
+            &dir,
+            "snapshot-host",
+            &TestHostConfig {
+                registration: registration.clone(),
+                invoke_rules: vec![
+                    InvokeRule {
+                        when_contains: Some(String::from(r#""action":"test.start""#)),
+                        when_invoke_index: None,
+                        when_session_index: None,
+                        effect: InvokeEffect {
+                            remove_file: Some(policy_path),
+                            response: ResponseTemplate::Output {
+                                output: json!({
+                                    "events": [{"type": "test.followup", "data": {}}]
+                                }),
+                            },
+                            ..InvokeEffect::default()
+                        },
+                    },
+                    InvokeRule {
+                        when_contains: Some(String::from(r#""action":"test.finish""#)),
+                        when_invoke_index: None,
+                        when_session_index: None,
+                        effect: InvokeEffect::default(),
+                    },
+                ],
+                ..TestHostConfig::with_registration(registration)
+            },
         )?;
         let host_manifest = dir.join("host.json");
         fs::write(

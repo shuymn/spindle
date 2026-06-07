@@ -8,6 +8,11 @@ use std::{
 };
 
 use serde_json::json;
+use spindle_extension_sdk::{ExtensionRegistration, RegistrationAction};
+use spindle_test_host::{
+    FailResponse, InvokeEffect, InvokeRule, RegisterResponse, ResponseTemplate, ShutdownResponse,
+    StartupAction, TestHostConfig,
+};
 
 use super::*;
 
@@ -34,27 +39,14 @@ fn relative_entrypoint_preserves_leading_parent_segments() {
 fn stdio_host_registers_and_invokes_without_respawning() -> Result<(), SpindleError> {
     let dir = crate::store::tests_support::test_dir()?;
     fs::create_dir_all(&dir)?;
-    let host = dir.join("host.sh");
-    crate::store::tests_support::write_executable(
-        &host,
-        r#"#!/bin/sh
-count=0
-while IFS= read -r line; do
-  case "$line" in
-    *'"type":"register"'*)
-      printf '%s\n' '{"type":"registration","registration":{"emits":["test.changed"],"capabilities":["test.write"],"actions":{"test.render":{}},"routes":[]}}'
-      ;;
-    *'"type":"invoke"'*)
-      count=$((count + 1))
-      printf '%s\n' '{"type":"action-output","output":{"events":[{"type":"test.rendered","source":"test-host","data":{"count":'"$count"'}}]}}'
-      ;;
-    *'"type":"shutdown"'*)
-      printf '%s\n' '{"type":"shutdown"}'
-      exit 0
-      ;;
-  esac
-done
-"#,
+    let registration = ExtensionRegistration::new()
+        .emit("test.changed")
+        .capability("test.write")
+        .action("test.render", RegistrationAction::new());
+    let host = crate::store::tests_support::install_test_host(
+        &dir,
+        "host",
+        &TestHostConfig::with_counting_invoke(registration, "test.rendered"),
     )?;
 
     let manifest = stdio_manifest("test-host", &host);
@@ -114,14 +106,13 @@ done
 fn stdio_host_registration_times_out() -> Result<(), SpindleError> {
     let dir = crate::store::tests_support::test_dir()?;
     fs::create_dir_all(&dir)?;
-    let host = dir.join("silent-host.sh");
-    crate::store::tests_support::write_executable(
-        &host,
-        r"#!/bin/sh
-while IFS= read -r _line; do
-  sleep 10
-done
-",
+    let host = crate::store::tests_support::install_test_host(
+        &dir,
+        "silent-host",
+        &TestHostConfig {
+            register_response: RegisterResponse::Sleep { ms: 10_000 },
+            ..TestHostConfig::default()
+        },
     )?;
 
     let manifest = stdio_manifest("silent-host", &host);
@@ -141,19 +132,13 @@ done
 fn stdio_host_rejects_oversized_response_line() -> Result<(), SpindleError> {
     let dir = crate::store::tests_support::test_dir()?;
     fs::create_dir_all(&dir)?;
-    let host = dir.join("oversized-host.sh");
-    crate::store::tests_support::write_executable(
-        &host,
-        r#"#!/bin/sh
-while IFS= read -r line; do
-  case "$line" in
-    *'"type":"register"'*)
-      head -c 1048577 /dev/zero | tr '\000' a
-      printf '\n'
-      ;;
-  esac
-done
-"#,
+    let host = crate::store::tests_support::install_test_host(
+        &dir,
+        "oversized-host",
+        &TestHostConfig {
+            register_response: RegisterResponse::Oversized { bytes: 1_048_577 },
+            ..TestHostConfig::default()
+        },
     )?;
 
     let manifest = stdio_manifest("oversized-host", &host);
@@ -171,23 +156,19 @@ fn registration_protocol_error_drops_and_terminates_temporary_session() -> Resul
     let dir = crate::store::tests_support::test_dir()?;
     fs::create_dir_all(&dir)?;
     let pid_file = dir.join("host.pid");
-    let host = dir.join("invalid-registration-host.sh");
-    crate::store::tests_support::write_executable(
-        &host,
-        &format!(
-            r#"#!/bin/sh
-echo $$ > {pid_file}
-while IFS= read -r line; do
-  case "$line" in
-    *register*)
-      printf '%s\n' '{{not-json}}'
-      while :; do sleep 1; done
-      ;;
-  esac
-done
-"#,
-            pid_file = pid_file.display()
-        ),
+    let host = crate::store::tests_support::install_test_host(
+        &dir,
+        "invalid-registration-host",
+        &TestHostConfig {
+            startup: StartupAction {
+                write_pid: Some(pid_file.clone()),
+                ..StartupAction::default()
+            },
+            register_response: RegisterResponse::InvalidJson {
+                line: String::from("{not-json}"),
+            },
+            ..TestHostConfig::default()
+        },
     )?;
     let manifest = stdio_manifest("invalid-registration-host", &host);
     let runtime = ExtensionRuntimeHost::new();
@@ -209,23 +190,17 @@ fn registration_oversized_response_drops_and_terminates_temporary_session()
     let dir = crate::store::tests_support::test_dir()?;
     fs::create_dir_all(&dir)?;
     let pid_file = dir.join("host.pid");
-    let host = dir.join("oversized-registration-host.sh");
-    crate::store::tests_support::write_executable(
-        &host,
-        &format!(
-            r#"#!/bin/sh
-echo $$ > {pid_file}
-while IFS= read -r line; do
-  case "$line" in
-    *register*)
-      head -c 1048577 /dev/zero | tr '\000' a
-      while :; do sleep 1; done
-      ;;
-  esac
-done
-"#,
-            pid_file = pid_file.display()
-        ),
+    let host = crate::store::tests_support::install_test_host(
+        &dir,
+        "oversized-registration-host",
+        &TestHostConfig {
+            startup: StartupAction {
+                write_pid: Some(pid_file.clone()),
+                ..StartupAction::default()
+            },
+            register_response: RegisterResponse::Oversized { bytes: 1_048_577 },
+            ..TestHostConfig::default()
+        },
     )?;
     let manifest = stdio_manifest("oversized-registration-host", &host);
     let runtime = ExtensionRuntimeHost::new();
@@ -242,23 +217,13 @@ done
 fn stdio_host_shutdown_kills_host_that_acknowledges_without_exiting() -> Result<(), SpindleError> {
     let dir = crate::store::tests_support::test_dir()?;
     fs::create_dir_all(&dir)?;
-    let host = dir.join("slow-shutdown-host.sh");
-    crate::store::tests_support::write_executable(
-        &host,
-        r#"#!/bin/sh
-while IFS= read -r line; do
-  case "$line" in
-    *'"type":"register"'*)
-      /bin/echo '{"type":"registration","registration":{"actions":{}}}'
-      ;;
-    *'"type":"shutdown"'*)
-      /bin/echo '{"type":"shutdown"}'
-      sleep 10
-      exit 0
-      ;;
-  esac
-done
-"#,
+    let host = crate::store::tests_support::install_test_host(
+        &dir,
+        "slow-shutdown-host",
+        &TestHostConfig {
+            shutdown: ShutdownResponse { sleep_ms: 100 },
+            ..TestHostConfig::default()
+        },
     )?;
 
     let manifest = stdio_manifest("slow-shutdown-host", &host);
@@ -431,27 +396,17 @@ done
 fn concurrent_first_invocations_spawn_one_stdio_session() -> Result<(), SpindleError> {
     let dir = crate::store::tests_support::test_dir()?;
     fs::create_dir_all(&dir)?;
-    let host = dir.join("single-spawn-host.sh");
     let starts = dir.join("starts.log");
-    crate::store::tests_support::write_executable(
-        &host,
-        &format!(
-            r#"#!/bin/sh
-echo $$ >> {starts}
-while IFS= read -r line; do
-  case "$line" in
-    *shutdown*)
-      printf '%s\n' '{{"type":"shutdown"}}'
-      exit 0
-      ;;
-    *)
-      printf '%s\n' '{{"type":"action-output","output":{{}}}}'
-      ;;
-  esac
-done
-"#,
-            starts = starts.display()
-        ),
+    let host = crate::store::tests_support::install_test_host(
+        &dir,
+        "single-spawn-host",
+        &TestHostConfig {
+            startup: StartupAction {
+                append_pid: Some(starts.clone()),
+                ..StartupAction::default()
+            },
+            ..TestHostConfig::default()
+        },
     )?;
     let runtime = Arc::new(ExtensionRuntimeHost::new());
     let extension = registered_stdio_extension(&dir, "single-spawn", &host);
@@ -523,27 +478,20 @@ fn shutdown_races_with_first_session_creation() -> Result<(), SpindleError> {
     let dir = crate::store::tests_support::test_dir()?;
     fs::create_dir_all(&dir)?;
     let started = dir.join("started");
-    let host = dir.join("slow-start-host.sh");
-    crate::store::tests_support::write_executable(
-        &host,
-        &format!(
-            r#"#!/bin/sh
-touch {started}
-while IFS= read -r line; do
-  case "$line" in
-    *shutdown*)
-      printf '%s\n' '{{"type":"shutdown"}}'
-      exit 0
-      ;;
-    *)
-      sleep 2
-      printf '%s\n' '{{"type":"action-output","output":{{}}}}'
-      ;;
-  esac
-done
-"#,
-            started = started.display()
-        ),
+    let host = crate::store::tests_support::install_test_host(
+        &dir,
+        "slow-start-host",
+        &TestHostConfig {
+            startup: StartupAction {
+                touch: Some(started.clone()),
+                ..StartupAction::default()
+            },
+            invoke_default: InvokeEffect {
+                sleep_ms: 2_000,
+                ..InvokeEffect::default()
+            },
+            ..TestHostConfig::default()
+        },
     )?;
     let runtime = Arc::new(ExtensionRuntimeHost::new());
     let extension = registered_stdio_extension(&dir, "slow-start", &host);
@@ -581,40 +529,40 @@ done
 fn stale_session_removal_does_not_evict_replacement_session() -> Result<(), SpindleError> {
     let dir = crate::store::tests_support::test_dir()?;
     fs::create_dir_all(&dir)?;
-    let marker = dir.join("seen");
     let pid_file = dir.join("host.pid");
-    let host = dir.join("replacement-safe-host.sh");
-    crate::store::tests_support::write_executable(
-        &host,
-        &format!(
-            r#"#!/bin/sh
-echo $$ > {pid_file}
-if [ -f {marker} ]; then
-  first=0
-else
-  touch {marker}
-  first=1
-fi
-while IFS= read -r line; do
-  case "$line" in
-    *shutdown*)
-      printf '%s\n' '{{"type":"shutdown"}}'
-      exit 0
-      ;;
-    *)
-      if [ "$first" -eq 1 ]; then
-        first=0
-        printf '%s\n' '{{not-json}}'
-        exit 0
-      fi
-      printf '%s\n' '{{"type":"action-output","output":{{"events":[{{"type":"test.rendered","source":"replacement-safe","data":{{"recovered":true}}}}]}}}}'
-      ;;
-  esac
-done
-"#,
-            marker = marker.display(),
-            pid_file = pid_file.display()
-        ),
+    let host = crate::store::tests_support::install_test_host(
+        &dir,
+        "replacement-safe-host",
+        &TestHostConfig {
+            startup: StartupAction {
+                write_pid: Some(pid_file.clone()),
+                session_marker: Some(dir.join("seen")),
+                ..StartupAction::default()
+            },
+            invoke_rules: vec![InvokeRule {
+                when_contains: None,
+                when_invoke_index: None,
+                when_session_index: Some(1),
+                effect: InvokeEffect {
+                    response: ResponseTemplate::Failure(FailResponse::InvalidJson {
+                        line: String::from("{not-json}"),
+                    }),
+                    ..InvokeEffect::default()
+                },
+            }],
+            invoke_default: InvokeEffect {
+                response: ResponseTemplate::Output {
+                    output: json!({
+                        "events": [{
+                            "type": "test.rendered",
+                            "data": { "recovered": true }
+                        }]
+                    }),
+                },
+                ..InvokeEffect::default()
+            },
+            ..TestHostConfig::default()
+        },
     )?;
     let runtime = ExtensionRuntimeHost::new();
     let extension = registered_stdio_extension(&dir, "replacement-safe", &host);
@@ -657,37 +605,38 @@ done
 fn unexpected_registration_response_evicts_stdio_session() -> Result<(), SpindleError> {
     let dir = crate::store::tests_support::test_dir()?;
     fs::create_dir_all(&dir)?;
-    let marker = dir.join("seen");
-    let host = dir.join("unexpected-response-host.sh");
-    crate::store::tests_support::write_executable(
-        &host,
-        &format!(
-            r#"#!/bin/sh
-if [ -f {marker} ]; then
-  first=0
-else
-  touch {marker}
-  first=1
-fi
-while IFS= read -r line; do
-  case "$line" in
-    *shutdown*)
-      printf '%s\n' '{{"type":"shutdown"}}'
-      exit 0
-      ;;
-    *)
-      if [ "$first" -eq 1 ]; then
-        first=0
-        printf '%s\n' '{{"type":"registration","registration":{{"actions":{{}}}}}}'
-      else
-        printf '%s\n' '{{"type":"action-output","output":{{"events":[{{"type":"test.rendered","source":"unexpected-response","data":{{"recovered":true}}}}]}}}}'
-      fi
-      ;;
-  esac
-done
-"#,
-            marker = marker.display()
-        ),
+    let host = crate::store::tests_support::install_test_host(
+        &dir,
+        "unexpected-response-host",
+        &TestHostConfig {
+            startup: StartupAction {
+                session_marker: Some(dir.join("seen")),
+                ..StartupAction::default()
+            },
+            invoke_rules: vec![InvokeRule {
+                when_contains: None,
+                when_invoke_index: None,
+                when_session_index: Some(1),
+                effect: InvokeEffect {
+                    response: ResponseTemplate::RegistrationSurface {
+                        registration: ExtensionRegistration::new(),
+                    },
+                    ..InvokeEffect::default()
+                },
+            }],
+            invoke_default: InvokeEffect {
+                response: ResponseTemplate::Output {
+                    output: json!({
+                        "events": [{
+                            "type": "test.rendered",
+                            "data": { "recovered": true }
+                        }]
+                    }),
+                },
+                ..InvokeEffect::default()
+            },
+            ..TestHostConfig::default()
+        },
     )?;
     let runtime = ExtensionRuntimeHost::new();
     let extension = registered_stdio_extension(&dir, "unexpected-response", &host);
@@ -720,22 +669,18 @@ done
 fn action_error_response_does_not_evict_stdio_session() -> Result<(), SpindleError> {
     let dir = crate::store::tests_support::test_dir()?;
     fs::create_dir_all(&dir)?;
-    let host = dir.join("action-error-host.sh");
-    crate::store::tests_support::write_executable(
-        &host,
-        r#"#!/bin/sh
-while IFS= read -r line; do
-  case "$line" in
-    *shutdown*)
-      printf '%s\n' '{"type":"shutdown"}'
-      exit 0
-      ;;
-    *)
-      printf '%s\n' '{"type":"error","error":"action failed"}'
-      ;;
-  esac
-done
-"#,
+    let host = crate::store::tests_support::install_test_host(
+        &dir,
+        "action-error-host",
+        &TestHostConfig {
+            invoke_default: InvokeEffect {
+                response: ResponseTemplate::Error {
+                    error: String::from("action failed"),
+                },
+                ..InvokeEffect::default()
+            },
+            ..TestHostConfig::default()
+        },
     )?;
     let runtime = ExtensionRuntimeHost::new();
     let extension = registered_stdio_extension(&dir, "action-error", &host);
@@ -784,15 +729,15 @@ impl RecoveryScenario {
         }
     }
 
-    fn first_failure_script(self) -> &'static str {
+    fn first_failure(self) -> FailResponse {
         match self {
-            Self::ProtocolInvalid => "printf '%s\\n' '{{not-json}}'; while :; do sleep 1; done",
-            Self::Timeout => "sleep 5",
-            Self::HostClosed => "exit 0",
-            Self::Oversized => {
-                "head -c 1048577 /dev/zero | tr '\\000' a; while :; do sleep 1; done"
-            }
-            Self::NonUtf8 => "printf '\\377\\n'; while :; do sleep 1; done",
+            Self::ProtocolInvalid => FailResponse::InvalidJson {
+                line: String::from("{not-json}"),
+            },
+            Self::Timeout => FailResponse::Sleep { ms: 5_000 },
+            Self::HostClosed => FailResponse::Exit { code: 0 },
+            Self::Oversized => FailResponse::Oversized { bytes: 1_048_577 },
+            Self::NonUtf8 => FailResponse::NonUtf8,
         }
     }
 
@@ -850,42 +795,26 @@ impl RecoveryScenario {
     }
 
     fn write_host(self, dir: &Path) -> Result<PathBuf, SpindleError> {
-        let marker = dir.join("seen");
         let pid_file = dir.join("host.pid");
-        let host = dir.join(format!("{}-then-valid-host.sh", self.id()));
-        crate::store::tests_support::write_executable(
-            &host,
-            &format!(
-                r#"#!/bin/sh
-echo $$ > {pid_file}
-if [ -f {marker} ]; then
-  first=0
-else
-  touch {marker}
-  first=1
-fi
-while IFS= read -r line; do
-  case "$line" in
-    *shutdown*)
-      printf '%s\n' '{{"type":"shutdown"}}'
-      exit 0
-      ;;
-    *)
-      if [ "$first" -eq 1 ]; then
-        first=0
-        {first_failure}
-      fi
-      printf '%s\n' '{{"type":"action-output","output":{{}}}}'
-      ;;
-  esac
-done
-"#,
-                marker = marker.display(),
-                pid_file = pid_file.display(),
-                first_failure = self.first_failure_script()
-            ),
-        )?;
-        Ok(host)
+        {
+            let mut config = TestHostConfig::default();
+            config.startup.write_pid = Some(pid_file);
+            config.startup.session_marker = Some(dir.join("seen"));
+            config.invoke_rules = vec![InvokeRule {
+                when_contains: None,
+                when_invoke_index: None,
+                when_session_index: Some(1),
+                effect: InvokeEffect {
+                    response: ResponseTemplate::Failure(self.first_failure()),
+                    ..InvokeEffect::default()
+                },
+            }];
+            crate::store::tests_support::install_test_host(
+                dir,
+                &format!("{}-then-valid-host", self.id()),
+                &config,
+            )
+        }
     }
 }
 

@@ -267,6 +267,8 @@ mod tests {
     use std::{collections::BTreeMap, fs, time::Duration};
 
     use serde_json::json;
+    use spindle_extension_sdk::{ExtensionRegistration, RegistrationAction};
+    use spindle_test_host::TestHostConfig;
 
     use super::*;
     use crate::{ContinuationGrantRequest, ContinuationStore};
@@ -355,26 +357,7 @@ mod tests {
     fn execute_emit_dispatches_installed_route() -> Result<(), SpindleError> {
         let dir = crate::store::tests_support::test_dir()?;
         fs::create_dir_all(&dir)?;
-        let host = dir.join("adapter-host.sh");
-        crate::store::tests_support::write_executable(
-            &host,
-            r#"#!/bin/sh
-while IFS= read -r line; do
-  case "$line" in
-    *'"type":"register"'*)
-      printf '%s\n' '{"type":"registration","registration":{"capabilities":["test.write"],"actions":{"test.render":{"capabilities":["test.write"]}}}}'
-      ;;
-    *'"type":"invoke"'*)
-      printf '%s\n' '{"type":"action-output","output":{}}'
-      ;;
-    *'"type":"shutdown"'*)
-      printf '%s\n' '{"type":"shutdown"}'
-      exit 0
-      ;;
-  esac
-done
-"#,
-        )?;
+        let host = crate::store::tests_support::test_host_with_write_render(&dir, "adapter-host")?;
         let adapter_manifest = dir.join("adapter.json");
         fs::write(
             &adapter_manifest,
@@ -437,26 +420,7 @@ done
     fn execute_invoke_requires_policy_for_granted_capabilities() -> Result<(), SpindleError> {
         let dir = crate::store::tests_support::test_dir()?;
         fs::create_dir_all(&dir)?;
-        let host = dir.join("policy-host.sh");
-        crate::store::tests_support::write_executable(
-            &host,
-            r#"#!/bin/sh
-while IFS= read -r line; do
-  case "$line" in
-    *'"type":"register"'*)
-      printf '%s\n' '{"type":"registration","registration":{"capabilities":["test.write"],"actions":{"test.render":{"capabilities":["test.write"]}}}}'
-      ;;
-    *'"type":"invoke"'*)
-      printf '%s\n' '{"type":"action-output","output":{}}'
-      ;;
-    *'"type":"shutdown"'*)
-      printf '%s\n' '{"type":"shutdown"}'
-      exit 0
-      ;;
-  esac
-done
-"#,
-        )?;
+        let host = crate::store::tests_support::test_host_with_write_render(&dir, "policy-host")?;
         let manifest = dir.join("extension.json");
         fs::write(
             &manifest,
@@ -511,25 +475,21 @@ done
     fn continuation_invoke_uses_original_capability_grant() -> Result<(), SpindleError> {
         let dir = crate::store::tests_support::test_dir()?;
         fs::create_dir_all(&dir)?;
-        let host = dir.join("continuation-host.sh");
-        crate::store::tests_support::write_executable(
-            &host,
-            r#"#!/bin/sh
-while IFS= read -r line; do
-  case "$line" in
-    *'"type":"register"'*)
-      printf '%s\n' '{"type":"registration","registration":{"capabilities":["test.read","test.write"],"actions":{"test.read":{"capabilities":["test.read"]},"test.write":{"capabilities":["test.write"]}}}}'
-      ;;
-    *'"type":"invoke"'*)
-      printf '%s\n' '{"type":"action-output","output":{}}'
-      ;;
-    *'"type":"shutdown"'*)
-      printf '%s\n' '{"type":"shutdown"}'
-      exit 0
-      ;;
-  esac
-done
-"#,
+        let registration = ExtensionRegistration::new()
+            .capability("test.read")
+            .capability("test.write")
+            .action(
+                "test.read",
+                RegistrationAction::new().capability("test.read"),
+            )
+            .action(
+                "test.write",
+                RegistrationAction::new().capability("test.write"),
+            );
+        let host = crate::store::tests_support::install_test_host(
+            &dir,
+            "continuation-host",
+            &TestHostConfig::with_registration(registration),
         )?;
         let manifest = dir.join("extension.json");
         fs::write(
@@ -582,25 +542,16 @@ done
     fn continuation_invoke_rejects_ungranted_capability() -> Result<(), SpindleError> {
         let dir = crate::store::tests_support::test_dir()?;
         fs::create_dir_all(&dir)?;
-        let host = dir.join("continuation-deny-host.sh");
-        crate::store::tests_support::write_executable(
-            &host,
-            r#"#!/bin/sh
-while IFS= read -r line; do
-  case "$line" in
-    *'"type":"register"'*)
-      printf '%s\n' '{"type":"registration","registration":{"capabilities":["test.write"],"actions":{"test.write":{"capabilities":["test.write"]}}}}'
-      ;;
-    *'"type":"invoke"'*)
-      printf '%s\n' '{"type":"action-output","output":{}}'
-      ;;
-    *'"type":"shutdown"'*)
-      printf '%s\n' '{"type":"shutdown"}'
-      exit 0
-      ;;
-  esac
-done
-"#,
+        let registration = ExtensionRegistration::new()
+            .capability("test.write")
+            .action(
+                "test.write",
+                RegistrationAction::new().capability("test.write"),
+            );
+        let host = crate::store::tests_support::install_test_host(
+            &dir,
+            "continuation-deny-host",
+            &TestHostConfig::with_registration(registration),
         )?;
         let manifest = dir.join("extension.json");
         fs::write(

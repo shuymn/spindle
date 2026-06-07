@@ -1,5 +1,8 @@
 use std::os::unix::fs::symlink;
 
+use spindle_extension_sdk::{ExtensionRegistration, RegistrationAction};
+use spindle_test_host::{StartupAction, TestHostConfig};
+
 use super::*;
 
 #[test]
@@ -241,30 +244,16 @@ fn trusted_runtime_registration_rejects_entrypoint_mutation_during_registration(
 -> Result<(), SpindleError> {
     let dir = crate::store::tests_support::test_dir()?;
     fs::create_dir_all(&dir)?;
-    let host = dir.join("mutating-host.sh");
-    crate::store::tests_support::write_executable(
-        &host,
-        r#"#!/bin/sh
-replacement="$0.replacement"
-cat > "$replacement" <<'SCRIPT'
-#!/bin/sh
-exit 42
-SCRIPT
-chmod 755 "$replacement"
-mv "$replacement" "$0"
-while IFS= read -r line; do
-  case "$line" in
-    *'"type":"register"'*)
-      printf '%s\n' '{"type":"registration","registration":{"actions":{"test.render":{}}}}'
-      ;;
-    *'"type":"shutdown"'*)
-      printf '%s\n' '{"type":"shutdown"}'
-      exit 0
-      ;;
-  esac
-done
-"#,
-    )?;
+    let registration =
+        ExtensionRegistration::new().action("test.render", RegistrationAction::new());
+    let config = TestHostConfig {
+        startup: StartupAction {
+            mutate_on_register: true,
+            ..StartupAction::default()
+        },
+        ..TestHostConfig::with_registration(registration)
+    };
+    let host = crate::store::tests_support::install_test_host(&dir, "mutating-host", &config)?;
     let manifest = write_stdio_manifest(&dir, "mutating.json", "mutating", &host)?;
     let runtime = ExtensionRuntimeHost::new();
 
@@ -351,8 +340,8 @@ fn trusted_invoke_executes_canonical_entrypoint_not_retargeted_symlink() -> Resu
 {
     let dir = crate::store::tests_support::test_dir()?;
     fs::create_dir_all(&dir)?;
-    let trusted_host = write_marker_stdio_host(&dir, "trusted-real", "trusted")?;
-    let malicious_host = write_marker_stdio_host(&dir, "malicious", "malicious")?;
+    let trusted_host = write_marker_shell_host(&dir, "trusted-real", "trusted")?;
+    let malicious_host = write_marker_shell_host(&dir, "malicious", "malicious")?;
     let entry_symlink = dir.join("entry.sh");
     symlink(&trusted_host, &entry_symlink)?;
     let manifest = write_stdio_manifest(&dir, "trusted.json", "trusted", &entry_symlink)?;

@@ -8,7 +8,10 @@ use std::{
 };
 
 use sha2::Digest;
-use spindle_extension_sdk::{ActionInvocation, RegistrationAction, RegistrationRoute};
+use spindle_extension_sdk::{
+    ActionInvocation, ExtensionRegistration, RegistrationAction, RegistrationRoute,
+};
+use spindle_test_host::TestHostConfig;
 
 use super::*;
 use crate::{ExtensionRuntimeHost, SpindleError};
@@ -107,6 +110,13 @@ fn registered_stdio_extension(dir: &Path, id: &str, host: &Path) -> RegisteredEx
 }
 
 fn write_marker_stdio_host(dir: &Path, name: &str, marker: &str) -> Result<PathBuf, SpindleError> {
+    let registration =
+        ExtensionRegistration::new().action("test.render", RegistrationAction::new());
+    let config = TestHostConfig::with_marker_invoke(registration, marker);
+    crate::store::tests_support::install_test_host(dir, name, &config)
+}
+
+fn write_marker_shell_host(dir: &Path, name: &str, marker: &str) -> Result<PathBuf, SpindleError> {
     let host = dir.join(format!("{name}.sh"));
     let script = format!(
         r#"#!/bin/sh

@@ -1,7 +1,9 @@
 [workspace]
 members = [
     "crates/spindle",
+    "crates/spindle-extension-example",
     "crates/spindle-extension-sdk",
+    "crates/spindle-test-host",
 ]
 resolver = "3"
 

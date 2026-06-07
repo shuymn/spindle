@@ -440,8 +440,18 @@ dependencies = [
  "serde_json",
  "sha2",
  "spindle-extension-sdk",
+ "spindle-test-host",
  "thiserror",
  "uuid",
+]
+
+[[package]]
+name = "spindle-extension-example"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "spindle-extension-sdk",
 ]
 
 [[package]]
@@ -451,6 +461,15 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "spindle-test-host"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "spindle-extension-sdk",
 ]
 
 [[package]]

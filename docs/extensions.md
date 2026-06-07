@@ -34,6 +34,13 @@ A manifest with empty surface requires dynamic registration through `install --t
 }
 ```
 
+The repository includes a workspace example extension:
+
+```bash
+cargo build -p spindle-extension-example --release --locked
+cargo run -p spindle -- install crates/spindle-extension-example
+```
+
 Event/action/capability surface can be written statically in the manifest, but `stdio-jsonl` extensions usually register it from extension code through the SDK.
 
 `emits` are event kinds an extension may observe from external input or IPC and emit. `produces` are event kinds an extension action may return in `ActionOutput`. Both are treated as event surface ownership, so two extensions cannot register the same event kind through either `emits` or `produces`.

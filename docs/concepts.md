@@ -70,11 +70,14 @@ If any condition is not met, design it as extension surface instead.
 
 ```text
 spindle/
-  crates/spindle/                daemon kernel, CLI, socket server
-  crates/spindle-extension-sdk/  typed SDK for stdio JSONL extension hosts
+  crates/spindle/                    daemon kernel, CLI, socket server
+  crates/spindle-extension-sdk/      typed SDK for stdio JSONL extension hosts
+  crates/spindle-extension-example/    minimal stdio JSONL extension example
+  crates/spindle-test-host/          config-driven test host (integration tests)
 ```
 
 - `crates/spindle/` — event log, dispatch, manifest validation, daemon
 - `crates/spindle-extension-sdk/` — contract types shared by the kernel and extension hosts
+- `crates/spindle-extension-example/` — reference extension built with the workspace
 
 `spindle-extension-sdk` is a library for extension authors. `crates/spindle` is the daemon itself; it depends on the SDK to validate and execute the extension contract.

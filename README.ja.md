@@ -22,9 +22,10 @@
 
 ```text
 spindle/
-  crates/spindle/                daemon カーネル、CLI、socket server
-  crates/spindle-extension-sdk/  stdio JSONL 拡張ホスト用の型付き SDK
-  docs/                          コンセプト、使い方、開発メモ
+  crates/spindle/                    daemon カーネル、CLI、socket server
+  crates/spindle-extension-sdk/      stdio JSONL 拡張ホスト用の型付き SDK
+  crates/spindle-extension-example/  最小 stdio JSONL 拡張のサンプル
+  docs/                              コンセプト、使い方、開発メモ
 ```
 
 ## Quick start

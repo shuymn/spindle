@@ -211,6 +211,8 @@ mod tests {
     use std::{fs, io::Read, os::unix::fs::PermissionsExt, thread};
 
     use serde_json::json;
+    use spindle_extension_sdk::{ExtensionRegistration, RegistrationAction};
+    use spindle_test_host::TestHostConfig;
 
     use super::*;
     use crate::{EventFilter, HubRequest};
@@ -473,27 +475,17 @@ mod tests {
             &dir,
             r#"{"emits":{},"direct":{"test-client":["test.write"]},"routes":{}}"#,
         )?;
-        let host = dir.join("host.sh");
-        crate::store::tests_support::write_executable(
-            &host,
-            r#"#!/bin/sh
-count=0
-while IFS= read -r line; do
-  case "$line" in
-    *'"type":"register"'*)
-      printf '%s\n' '{"type":"registration","registration":{"produces":["test.rendered"],"capabilities":["test.write"],"actions":{"test.render":{"capabilities":["test.write"]}}}}'
-      ;;
-    *'"type":"invoke"'*)
-      count=$((count + 1))
-      printf '%s\n' '{"type":"action-output","output":{"events":[{"type":"test.rendered","source":"test-host","data":{"count":'"$count"'}}]}}'
-      ;;
-    *'"type":"shutdown"'*)
-      printf '%s\n' '{"type":"shutdown"}'
-      exit 0
-      ;;
-  esac
-done
-"#,
+        let registration = ExtensionRegistration::new()
+            .produce("test.rendered")
+            .capability("test.write")
+            .action(
+                "test.render",
+                RegistrationAction::new().capability("test.write"),
+            );
+        let host = crate::store::tests_support::install_test_host(
+            &dir,
+            "host",
+            &TestHostConfig::with_counting_invoke(registration, "test.rendered"),
         )?;
         let manifest = dir.join("extension.json");
         fs::write(

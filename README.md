@@ -22,9 +22,10 @@ Experimental. The repository currently contains the daemon kernel and the extens
 
 ```text
 spindle/
-  crates/spindle/                daemon kernel, CLI, socket server
-  crates/spindle-extension-sdk/  typed SDK for stdio JSONL extension hosts
-  docs/                          concepts, usage, and development notes
+  crates/spindle/                    daemon kernel, CLI, socket server
+  crates/spindle-extension-sdk/      typed SDK for stdio JSONL extension hosts
+  crates/spindle-extension-example/  minimal stdio JSONL extension example
+  docs/                              concepts, usage, and development notes
 ```
 
 ## Quick start
