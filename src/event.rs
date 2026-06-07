@@ -1,9 +1,7 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{SpindleError, validate_json_object, validate_name, validate_subject};
+use crate::{SpindleError, now_unix_ms, validate_json_object, validate_name, validate_subject};
 
 /// Append-only event envelope used by spindle clients and extensions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +97,20 @@ pub struct ActionRequest {
     pub capabilities: Vec<String>,
     /// Action arguments.
     pub args: Value,
+    /// Continuation provenance for deferred extension work.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<ContinuationAudit>,
+}
+
+/// Continuation provenance stamped into deferred action audit events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContinuationAudit {
+    /// Opaque continuation identifier.
+    pub id: String,
+    /// Extension that received the continuation.
+    pub extension: String,
+    /// Original action that received the continuation.
+    pub action: String,
 }
 
 impl ActionRequest {
@@ -145,10 +157,6 @@ impl EventFilter {
             .is_none_or(|source| source == &event.source);
         kind_matches && source_matches
     }
-}
-
-fn now_unix_ms() -> Result<u128, SpindleError> {
-    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())
 }
 
 fn uuid_v7_string() -> String {
@@ -233,6 +241,7 @@ mod tests {
             requested_by: String::from("raycast"),
             capabilities: vec![String::from("aerospace.window.control")],
             args: json!({ "name": "dev" }),
+            continuation: None,
         }
         .into_event()?;
 

@@ -13,8 +13,8 @@ use std::{
 };
 
 use crate::{
-    EventLog, ExtensionRegistry, ExtensionRuntimeHost, HubRequest, HubResponse, SpindleError,
-    execute_request,
+    ContinuationConfig, ContinuationStore, EventLog, ExtensionRegistry, ExtensionRuntimeHost,
+    HubRequest, HubResponse, SpindleError, execute_request_with_continuations,
     protocol::{DEFAULT_JSONL_MESSAGE_LIMIT, read_limited_jsonl_line},
     store::ensure_private_parent,
 };
@@ -30,7 +30,7 @@ pub fn serve(socket_path: &Path, log: &EventLog) -> Result<(), SpindleError> {
     prepare_socket(socket_path)?;
     let listener = UnixListener::bind(socket_path)?;
     fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600))?;
-    let state = Arc::new(ServerState::new(log.clone()));
+    let state = Arc::new(ServerState::new(log.clone(), socket_path.to_path_buf()));
 
     for stream in listener.incoming() {
         spawn_stream_handler(stream?, Arc::clone(&state));
@@ -86,19 +86,30 @@ struct ServerState {
     log: EventLog,
     registry: ExtensionRegistry,
     runtime: Arc<ExtensionRuntimeHost>,
+    continuation: ContinuationConfig,
 }
 
 impl ServerState {
-    fn new(log: EventLog) -> Self {
+    fn new(log: EventLog, socket: std::path::PathBuf) -> Self {
         Self {
             registry: registry_for_log(&log),
+            continuation: ContinuationConfig {
+                store: ContinuationStore::default(),
+                socket,
+            },
             log,
             runtime: Arc::new(ExtensionRuntimeHost::new()),
         }
     }
 
     fn execute(&self, request: HubRequest) -> Result<serde_json::Value, SpindleError> {
-        execute_request(request, &self.log, &self.registry, &self.runtime)
+        execute_request_with_continuations(
+            request,
+            &self.log,
+            &self.registry,
+            &self.runtime,
+            Some(&self.continuation),
+        )
     }
 }
 
@@ -283,7 +294,7 @@ mod tests {
             &dir,
             r#"{"emits":{"pi":["agent.status.changed"]},"direct":{},"routes":{}}"#,
         )?;
-        let server_state = ServerState::new(log.clone());
+        let server_state = ServerState::new(log.clone(), socket.clone());
         let listener = UnixListener::bind(&socket)?;
 
         let handle = thread::spawn(move || -> Result<(), SpindleError> {
@@ -319,7 +330,7 @@ mod tests {
     fn server_rejects_non_utf8_request() -> Result<(), SpindleError> {
         let dir = crate::store::tests_support::test_dir()?;
         fs::create_dir_all(&dir)?;
-        let state = ServerState::new(EventLog::in_dir(&dir));
+        let state = ServerState::new(EventLog::in_dir(&dir), dir.join("spindle.sock"));
         let (mut client, server) = UnixStream::pair()?;
         let handle = thread::spawn(move || handle_stream(server, &state));
 
@@ -345,7 +356,7 @@ mod tests {
     fn oversized_request_returns_one_error_then_closes() -> Result<(), SpindleError> {
         let dir = crate::store::tests_support::test_dir()?;
         fs::create_dir_all(&dir)?;
-        let state = ServerState::new(EventLog::in_dir(&dir));
+        let state = ServerState::new(EventLog::in_dir(&dir), dir.join("spindle.sock"));
         let (mut client, server) = UnixStream::pair()?;
         let handle = thread::spawn(move || handle_stream(server, &state));
 
@@ -374,7 +385,7 @@ mod tests {
     fn malformed_json_response_keeps_connection_alive() -> Result<(), SpindleError> {
         let dir = crate::store::tests_support::test_dir()?;
         fs::create_dir_all(&dir)?;
-        let state = ServerState::new(EventLog::in_dir(&dir));
+        let state = ServerState::new(EventLog::in_dir(&dir), dir.join("spindle.sock"));
         let (mut client, server) = UnixStream::pair()?;
         let handle = thread::spawn(move || handle_stream(server, &state));
 
@@ -406,7 +417,7 @@ mod tests {
     fn partial_request_returns_protocol_error() -> Result<(), SpindleError> {
         let dir = crate::store::tests_support::test_dir()?;
         fs::create_dir_all(&dir)?;
-        let state = ServerState::new(EventLog::in_dir(&dir));
+        let state = ServerState::new(EventLog::in_dir(&dir), dir.join("spindle.sock"));
         let (mut client, server) = UnixStream::pair()?;
         let handle = thread::spawn(move || handle_stream(server, &state));
 
@@ -431,7 +442,7 @@ mod tests {
     fn live_partial_peer_times_out_with_protocol_error() -> Result<(), SpindleError> {
         let dir = crate::store::tests_support::test_dir()?;
         fs::create_dir_all(&dir)?;
-        let state = ServerState::new(EventLog::in_dir(&dir));
+        let state = ServerState::new(EventLog::in_dir(&dir), dir.join("spindle.sock"));
         let (mut client, server) = UnixStream::pair()?;
         let handle = thread::spawn(move || {
             handle_stream_with_timeout(server, &state, Duration::from_millis(50))
@@ -498,7 +509,7 @@ done
         let socket = dir.join("spindle.sock");
         let log = EventLog::in_dir(&dir);
         let server_log = log.clone();
-        let server_state = ServerState::new(server_log);
+        let server_state = ServerState::new(server_log, socket.clone());
         let listener = UnixListener::bind(&socket)?;
 
         let handle = thread::spawn(move || -> Result<(), SpindleError> {

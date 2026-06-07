@@ -2,22 +2,34 @@
 #![warn(clippy::nursery)]
 #![warn(clippy::cargo)]
 
-use std::{collections::BTreeSet, env};
+use std::{
+    collections::BTreeSet,
+    env,
+    io::{BufRead, BufReader, Write},
+    os::unix::net::UnixStream,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    thread,
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use serde::Deserialize;
 use serde_json::json;
 use spindle_extension_sdk::{
-    ActionContext, ActionHandler, ActionInvocation, ActionOutput, ExtensionContext,
-    ExtensionRegistration, RegistrationAction, RegistrationRoute, serve_stdio_jsonl_actions,
+    ActionContext, ActionInvocation, ActionOutput, ContinuationContext, ExtensionContext,
+    ExtensionRegistration, RegistrationAction, RegistrationRoute, serve_stdio_jsonl_host,
 };
 use spindle_workspace_indicator_extension::{
     OUTPUT_EVENT, WorkspaceSnapshot, build_status_message, build_workspace_message,
 };
 
 const DEFAULT_WORKSPACES: &str = "1,2,3,4,5,6,7,8,9,10";
-const WORKSPACE_SETTLE_MS: u64 = 50;
+const WORKSPACE_DEBOUNCE_MS: u64 = 50;
+const ACTION_SCHEDULE_WORKSPACES: &str = "workspace-indicator.workspaces.schedule";
 const ACTION_RENDER_WORKSPACES: &str = "workspace-indicator.workspaces.render";
 const ACTION_RENDER_STATUS: &str = "workspace-indicator.status.render";
 const OUTPUT_ACTION: &str = "sketchybar.message.send";
@@ -94,20 +106,25 @@ impl Cli {
 
 fn serve_host() -> Result<()> {
     let registration = registration();
-    Ok(serve_stdio_jsonl_actions(&registration, ACTION_HANDLERS)?)
+    let scheduler = SchedulerState::default();
+    Ok(serve_stdio_jsonl_host(&registration, move |context| {
+        route_host_action(&scheduler, context)
+    })?)
 }
 
-const ACTION_HANDLERS: &[ActionHandler<anyhow::Error>] = &[
-    ActionHandler::new(ACTION_RENDER_WORKSPACES, render_workspaces_host_action),
-    ActionHandler::new(ACTION_RENDER_STATUS, render_status_host_action),
-];
-
-fn render_workspaces_host_action(context: &ActionContext) -> Result<ActionOutput> {
-    render_workspaces_action(None, context)
+#[derive(Debug, Clone, Default)]
+struct SchedulerState {
+    generation: Arc<AtomicU64>,
 }
 
-fn render_status_host_action(context: &ActionContext) -> Result<ActionOutput> {
-    render_status_action(None, context)
+fn route_host_action(scheduler: &SchedulerState, context: &ActionContext) -> Result<ActionOutput> {
+    match context.action() {
+        Some(ACTION_SCHEDULE_WORKSPACES) => schedule_workspaces_action(scheduler, context),
+        Some(ACTION_RENDER_WORKSPACES) => render_workspaces_action(None, context),
+        Some(ACTION_RENDER_STATUS) => render_status_action(None, context),
+        Some(action) => anyhow::bail!("unknown action: {action}"),
+        None => anyhow::bail!("missing action"),
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -186,6 +203,57 @@ fn resolve_item(explicit: Option<String>, action_args: &RenderStatusActionArgs) 
         .context("NAME is not set and --item was not provided")
 }
 
+fn schedule_workspaces_action(
+    scheduler: &SchedulerState,
+    context: &ActionContext,
+) -> Result<ActionOutput> {
+    ensure_scheduler_surface(context.extension())?;
+    let continuation = context
+        .continuation()
+        .cloned()
+        .context("continuation is required for workspace scheduling")?;
+    let generation = scheduler.generation.fetch_add(1, Ordering::AcqRel) + 1;
+    let scheduler = scheduler.clone();
+    let _worker = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(WORKSPACE_DEBOUNCE_MS));
+        if scheduler.generation.load(Ordering::Acquire) != generation {
+            return;
+        }
+        if let Err(error) = invoke_workspace_snapshot(&continuation) {
+            eprintln!("[workspace-indicator] scheduler snapshot failed: {error:#}");
+        }
+    });
+    Ok(ActionOutput::empty())
+}
+
+fn invoke_workspace_snapshot(continuation: &ContinuationContext) -> Result<()> {
+    let mut stream = UnixStream::connect(&continuation.socket).with_context(|| {
+        format!(
+            "failed to connect to spindle socket: {}",
+            continuation.socket
+        )
+    })?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let request = json!({
+        "command": "continuation-invoke",
+        "continuation": continuation.id,
+        "action": AEROSPACE_WORKSPACE_SNAPSHOT_ACTION,
+        "args": {}
+    });
+    serde_json::to_writer(&mut stream, &request)?;
+    writeln!(stream)?;
+    stream.shutdown(std::net::Shutdown::Write)?;
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let response = serde_json::from_str::<serde_json::Value>(&line)?;
+    if response.get("status").and_then(serde_json::Value::as_str) == Some("ok") {
+        return Ok(());
+    }
+    anyhow::bail!("continuation invoke failed: {response}")
+}
+
 fn render_workspaces_action(
     explicit_workspaces: Option<&str>,
     context: &ActionContext,
@@ -246,6 +314,18 @@ fn cli_context(
     ))
 }
 
+fn ensure_scheduler_surface(extension: Option<&ExtensionContext>) -> Result<()> {
+    ensure_output_surface(extension)?;
+    let Some(extension) = extension else {
+        return Ok(());
+    };
+
+    if !extension.has_action(AEROSPACE_WORKSPACE_SNAPSHOT_ACTION) {
+        anyhow::bail!("required action is not available: {AEROSPACE_WORKSPACE_SNAPSHOT_ACTION}");
+    }
+    Ok(())
+}
+
 fn ensure_output_surface(extension: Option<&ExtensionContext>) -> Result<()> {
     let Some(extension) = extension else {
         return Ok(());
@@ -263,8 +343,18 @@ fn ensure_output_surface(extension: Option<&ExtensionContext>) -> Result<()> {
 fn registration() -> ExtensionRegistration {
     ExtensionRegistration::new()
         .produce(OUTPUT_EVENT)
-        .route(workspace_snapshot_route(AEROSPACE_WORKSPACE_CHANGED_EVENT))
-        .route(workspace_snapshot_route(AEROSPACE_MONITOR_CHANGED_EVENT))
+        .action(
+            ACTION_SCHEDULE_WORKSPACES,
+            RegistrationAction::new().capability(AEROSPACE_STATE_READ_CAPABILITY),
+        )
+        .route(state_route(
+            AEROSPACE_WORKSPACE_CHANGED_EVENT,
+            ACTION_SCHEDULE_WORKSPACES,
+        ))
+        .route(state_route(
+            AEROSPACE_MONITOR_CHANGED_EVENT,
+            ACTION_SCHEDULE_WORKSPACES,
+        ))
         .on_from(
             "aerospace",
             AEROSPACE_WORKSPACE_SNAPSHOT_ACTION,
@@ -316,7 +406,101 @@ fn state_route(event: &str, action: &str) -> RegistrationRoute {
         .capability(AEROSPACE_STATE_READ_CAPABILITY)
 }
 
-fn workspace_snapshot_route(event: &str) -> RegistrationRoute {
-    state_route(event, AEROSPACE_WORKSPACE_SNAPSHOT_ACTION)
-        .with_args(json!({ "settle_ms": WORKSPACE_SETTLE_MS }))
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        io::{BufRead, BufReader, Write},
+        os::unix::net::UnixListener,
+        sync::mpsc,
+        time::Duration,
+    };
+
+    use spindle_extension_sdk::{
+        ActionDescriptor, ContinuationContext, EventDescriptor, ExtensionContext,
+    };
+
+    use super::*;
+
+    fn scheduler_context(socket: &std::path::Path) -> ActionContext {
+        ActionContext::from_invocation(
+            ActionInvocation::new(ACTION_SCHEDULE_WORKSPACES, json!({}))
+                .with_extension(Some(ExtensionContext {
+                    id: String::from("workspace-indicator"),
+                    events: vec![EventDescriptor {
+                        kind: String::from(OUTPUT_EVENT),
+                        source_extension: String::from("workspace-indicator"),
+                    }],
+                    actions: vec![
+                        ActionDescriptor {
+                            name: String::from(AEROSPACE_WORKSPACE_SNAPSHOT_ACTION),
+                            extension: String::from("aerospace"),
+                            capabilities: vec![String::from(AEROSPACE_STATE_READ_CAPABILITY)],
+                        },
+                        ActionDescriptor {
+                            name: String::from(OUTPUT_ACTION),
+                            extension: String::from("sketchybar"),
+                            capabilities: vec![String::from(SKETCHYBAR_UI_WRITE_CAPABILITY)],
+                        },
+                    ],
+                    capabilities: vec![
+                        String::from(AEROSPACE_STATE_READ_CAPABILITY),
+                        String::from(SKETCHYBAR_UI_WRITE_CAPABILITY),
+                    ],
+                }))
+                .with_continuation(Some(ContinuationContext::new(
+                    "continuation-1",
+                    socket.display().to_string(),
+                    9_999_999_999,
+                ))),
+        )
+    }
+
+    #[test]
+    fn schedule_action_returns_without_rendering_synchronously() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let socket = dir.path().join("spindle.sock");
+        let context = scheduler_context(&socket);
+        let scheduler = SchedulerState::default();
+
+        let output = schedule_workspaces_action(&scheduler, &context)?;
+
+        assert!(output.emitted_events().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn rapid_schedule_actions_invoke_only_latest_snapshot() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let socket = dir.path().join("spindle.sock");
+        if socket.exists() {
+            fs::remove_file(&socket)?;
+        }
+        let listener = UnixListener::bind(&socket)?;
+        listener.set_nonblocking(false)?;
+        let (sender, receiver) = mpsc::channel();
+        let server = std::thread::spawn(move || -> Result<()> {
+            let (mut stream, _address) = listener.accept()?;
+            let mut line = String::new();
+            BufReader::new(stream.try_clone()?).read_line(&mut line)?;
+            sender.send(line)?;
+            stream.write_all(b"{\"status\":\"ok\",\"data\":{}}\n")?;
+            stream.flush()?;
+            Ok(())
+        });
+        let scheduler = SchedulerState::default();
+        let first = scheduler_context(&socket);
+        let second = scheduler_context(&socket);
+
+        schedule_workspaces_action(&scheduler, &first)?;
+        schedule_workspaces_action(&scheduler, &second)?;
+
+        let request = receiver.recv_timeout(Duration::from_secs(1))?;
+        assert!(request.contains(r#""command":"continuation-invoke""#));
+        assert!(request.contains(r#""action":"aerospace.workspace.snapshot""#));
+        server
+            .join()
+            .map_err(|_payload| anyhow::anyhow!("server thread panicked"))??;
+        Ok(())
+    }
 }

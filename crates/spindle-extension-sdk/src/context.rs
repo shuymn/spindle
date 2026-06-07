@@ -3,6 +3,29 @@ use serde_json::Value;
 
 use crate::{ActionInvocation, ExtensionSdkError};
 
+/// Capability-scoped handle for deferred extension work through spindle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContinuationContext {
+    /// Opaque continuation identifier validated by the core.
+    pub id: String,
+    /// Unix socket path accepting continuation-backed requests.
+    pub socket: String,
+    /// Expiry time as milliseconds since Unix epoch.
+    pub expires_unix_ms: u128,
+}
+
+impl ContinuationContext {
+    /// Create a continuation context.
+    #[must_use]
+    pub fn new(id: impl Into<String>, socket: impl Into<String>, expires_unix_ms: u128) -> Self {
+        Self {
+            id: id.into(),
+            socket: socket.into(),
+            expires_unix_ms,
+        }
+    }
+}
+
 /// Typed context passed to an extension action.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionContext {
@@ -10,6 +33,7 @@ pub struct ActionContext {
     args: Value,
     event: Option<EventContext>,
     extension: Option<ExtensionContext>,
+    continuation: Option<ContinuationContext>,
 }
 
 impl ActionContext {
@@ -55,17 +79,25 @@ impl ActionContext {
         self.extension.as_ref()
     }
 
+    /// Return a deferred-work continuation handle, if supplied by the core.
+    #[must_use]
+    pub const fn continuation(&self) -> Option<&ContinuationContext> {
+        self.continuation.as_ref()
+    }
+
     pub(crate) const fn from_parts(
         action: Option<String>,
         args: Value,
         event: Option<EventContext>,
         extension: Option<ExtensionContext>,
+        continuation: Option<ContinuationContext>,
     ) -> Self {
         Self {
             action,
             args,
             event,
             extension,
+            continuation,
         }
     }
 }

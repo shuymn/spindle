@@ -12,7 +12,8 @@ mod registration;
 
 pub use action::{ActionInvocation, ActionOutput, ActionOutputEvent};
 pub use context::{
-    ActionContext, ActionDescriptor, EventContext, EventDescriptor, ExtensionContext,
+    ActionContext, ActionDescriptor, ContinuationContext, EventContext, EventDescriptor,
+    ExtensionContext,
 };
 pub use error::ExtensionSdkError;
 pub use host::{
@@ -241,6 +242,47 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&request)?,
             r#"{"type":"invoke","invocation":{"action":"test.render","args":{},"event":null,"extension":null}}"#
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn action_invocation_serializes_continuation_context() -> Result<(), ExtensionSdkError> {
+        let invocation =
+            ActionInvocation::new("test.schedule", serde_json::json!({})).with_continuation(Some(
+                ContinuationContext::new("cont-1", "/tmp/spindle.sock", 1_234),
+            ));
+
+        assert_eq!(
+            serde_json::to_string(&invocation)?,
+            r#"{"action":"test.schedule","args":{},"event":null,"extension":null,"continuation":{"id":"cont-1","socket":"/tmp/spindle.sock","expires_unix_ms":1234}}"#
+        );
+        let context = invocation.into_context();
+        assert_eq!(
+            context.continuation(),
+            Some(&ContinuationContext::new(
+                "cont-1",
+                "/tmp/spindle.sock",
+                1_234
+            ))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn host_request_invoke_serializes_continuation_context() -> Result<(), ExtensionSdkError> {
+        let request = HostRequest::Invoke {
+            invocation: ActionInvocation::new("test.schedule", serde_json::json!({}))
+                .with_continuation(Some(ContinuationContext::new(
+                    "cont-1",
+                    "/tmp/spindle.sock",
+                    1_234,
+                ))),
+        };
+
+        assert_eq!(
+            serde_json::to_string(&request)?,
+            r#"{"type":"invoke","invocation":{"action":"test.schedule","args":{},"event":null,"extension":null,"continuation":{"id":"cont-1","socket":"/tmp/spindle.sock","expires_unix_ms":1234}}}"#
         );
         Ok(())
     }

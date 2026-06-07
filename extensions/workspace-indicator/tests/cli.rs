@@ -76,7 +76,7 @@ fn cli_rejects_missing_registered_output_action() -> anyhow::Result<()> {
 }
 
 #[test]
-fn register_snapshot_handler_routes_are_source_bound_to_aerospace() -> anyhow::Result<()> {
+fn register_workspace_routes_use_extension_owned_async_scheduler() -> anyhow::Result<()> {
     let output = Command::new(env!("CARGO_BIN_EXE_spindle-workspace-indicator"))
         .arg("register")
         .output()?;
@@ -88,6 +88,18 @@ fn register_snapshot_handler_routes_are_source_bound_to_aerospace() -> anyhow::R
     );
     let stdout = String::from_utf8(output.stdout)?;
     let registration = serde_json::from_str::<ExtensionRegistration>(&stdout)?;
+    for event in ["aerospace.workspace.changed", "aerospace.monitor.changed"] {
+        let route = registration
+            .routes
+            .iter()
+            .find(|route| route.event == event)
+            .ok_or_else(|| anyhow::anyhow!("missing route event: {event}"))?;
+        assert_eq!(route.source.as_deref(), Some("aerospace"));
+        assert_eq!(route.action, "workspace-indicator.workspaces.schedule");
+        assert_eq!(route.capabilities, ["aerospace.state.read"]);
+        assert_eq!(route.args, serde_json::json!({}));
+    }
+
     for event in [
         "aerospace.workspace.snapshot",
         "aerospace.mode.snapshot",
@@ -116,6 +128,7 @@ fn cli_register_ignores_unrelated_spindle_env() -> anyhow::Result<()> {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains(r#""workspace-indicator.workspaces.schedule""#));
     assert!(stdout.contains(r#""workspace-indicator.workspaces.render""#));
     assert!(stdout.contains(r#""produces":["workspace-indicator.sketchybar.message.requested"]"#));
     Ok(())

@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{ActionContext, EventContext, ExtensionContext, ExtensionSdkError, empty_object};
+use crate::{
+    ActionContext, ContinuationContext, EventContext, ExtensionContext, ExtensionSdkError,
+    empty_object,
+};
 
 /// Action invocation serialized by the spindle kernel for an extension host.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -10,6 +13,8 @@ pub struct ActionInvocation {
     pub(crate) args: Value,
     pub(crate) event: Option<EventContext>,
     pub(crate) extension: Option<ExtensionContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) continuation: Option<ContinuationContext>,
 }
 
 impl ActionInvocation {
@@ -21,6 +26,7 @@ impl ActionInvocation {
             args,
             event: None,
             extension: None,
+            continuation: None,
         }
     }
 
@@ -38,10 +44,23 @@ impl ActionInvocation {
         self
     }
 
+    /// Attach a deferred-work continuation handle to this invocation.
+    #[must_use]
+    pub fn with_continuation(mut self, continuation: Option<ContinuationContext>) -> Self {
+        self.continuation = continuation;
+        self
+    }
+
     /// Convert this invocation into an in-process action context.
     #[must_use]
     pub fn into_context(self) -> ActionContext {
-        ActionContext::from_parts(Some(self.action), self.args, self.event, self.extension)
+        ActionContext::from_parts(
+            Some(self.action),
+            self.args,
+            self.event,
+            self.extension,
+            self.continuation,
+        )
     }
 }
 

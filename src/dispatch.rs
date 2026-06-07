@@ -8,8 +8,8 @@ use spindle_extension_sdk::{
 };
 
 use crate::{
-    CapabilityPolicy, Event, EventLog, ExtensionRegistry, ExtensionRuntime, ExtensionRuntimeHost,
-    RegisteredExtension, SpindleError,
+    CapabilityPolicy, ContinuationConfig, Event, EventLog, ExtensionAction, ExtensionRegistry,
+    ExtensionRuntime, ExtensionRuntimeHost, RegisteredExtension, SpindleError,
 };
 
 const MAX_DISPATCH_DEPTH: usize = 16;
@@ -29,6 +29,7 @@ pub struct Dispatcher<'a> {
     registry: &'a ExtensionRegistry,
     log: Option<&'a EventLog>,
     runtime: &'a ExtensionRuntimeHost,
+    continuation: Option<&'a ContinuationConfig>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -69,6 +70,7 @@ impl<'a> Dispatcher<'a> {
             registry,
             log: None,
             runtime,
+            continuation: None,
         }
     }
 
@@ -83,7 +85,18 @@ impl<'a> Dispatcher<'a> {
             registry,
             log: Some(log),
             runtime,
+            continuation: None,
         }
+    }
+
+    /// Attach continuation configuration used to pass deferred-work handles to extension actions.
+    #[must_use]
+    pub const fn with_continuation_config(
+        mut self,
+        continuation: Option<&'a ContinuationConfig>,
+    ) -> Self {
+        self.continuation = continuation;
+        self
     }
 
     /// Dispatch routes matching an event.
@@ -167,13 +180,16 @@ impl<'a> Dispatcher<'a> {
         };
         ensure_capabilities(action, definition, scope.capabilities)?;
 
+        let continuation =
+            self.create_continuation_for_action(action, extension, definition, scope)?;
         let invocation = ActionInvocation::new(action, args.clone())
             .with_event(
                 scope
                     .event
                     .map(|event| EventContext::new(event.kind.clone(), event.data.clone())),
             )
-            .with_extension(Some(scope.surface.context_for(extension)));
+            .with_extension(Some(scope.surface.context_for(extension)))
+            .with_continuation(continuation);
         let output = self.runtime.invoke_action(extension, action, &invocation)?;
 
         let mut reports = vec![DispatchReport {
@@ -191,6 +207,32 @@ impl<'a> Dispatcher<'a> {
         }
 
         Ok(reports)
+    }
+
+    fn create_continuation_for_action(
+        &self,
+        action: &str,
+        extension: &RegisteredExtension,
+        definition: &ExtensionAction,
+        scope: ActionDispatchScope<'_>,
+    ) -> Result<Option<spindle_extension_sdk::ContinuationContext>, SpindleError> {
+        let Some(config) = self.continuation else {
+            return Ok(None);
+        };
+        if scope.depth != 0 {
+            return Ok(None);
+        }
+
+        let granted_capabilities = scope
+            .capabilities
+            .iter()
+            .filter(|capability| definition.capabilities.contains(capability))
+            .cloned()
+            .collect::<Vec<_>>();
+        config
+            .store
+            .create(&extension.id, action, &granted_capabilities, &config.socket)
+            .map(Some)
     }
 }
 
@@ -357,7 +399,7 @@ fn ensure_capabilities(
     Ok(())
 }
 
-fn ensure_produced_event(
+pub fn ensure_produced_event(
     extension: &RegisteredExtension,
     action: &str,
     kind: &str,

@@ -13,6 +13,7 @@
 #![allow(clippy::multiple_crate_versions)]
 
 pub mod cli;
+mod continuation;
 mod dispatch;
 mod event;
 mod extension;
@@ -26,13 +27,16 @@ mod store;
 
 use std::{io, path::PathBuf, time::SystemTimeError};
 
+pub use continuation::{
+    ContinuationConfig, ContinuationGrant, ContinuationGrantRequest, ContinuationStore,
+};
 pub use dispatch::{DispatchReport, Dispatcher};
-pub use event::{ActionRequest, Event, EventBuilder, EventFilter};
+pub use event::{ActionRequest, ContinuationAudit, Event, EventBuilder, EventFilter};
 pub use extension::{
     ExtensionAction, ExtensionManifest, ExtensionRegistry, ExtensionRoute, ExtensionRuntime,
     RegisteredExtension, RegisteredRuntimeTrust,
 };
-pub use handler::execute_request;
+pub use handler::{execute_request, execute_request_with_continuations};
 pub use policy::CapabilityPolicy;
 pub use protocol::{HubRequest, HubResponse};
 pub use runtime::ExtensionRuntimeHost;
@@ -251,6 +255,14 @@ pub enum SpindleError {
         source: serde_json::Error,
     },
 
+    /// Continuation handle is unknown or malformed.
+    #[error("continuation handle is invalid")]
+    ContinuationInvalid,
+
+    /// Continuation handle is expired.
+    #[error("continuation handle is expired")]
+    ContinuationExpired,
+
     /// Event dispatch recursed too deeply.
     #[error("extension dispatch exceeded maximum depth")]
     DispatchDepthExceeded,
@@ -266,6 +278,12 @@ pub enum SpindleError {
     /// JSON parsing or serialization failed.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+}
+
+pub(crate) fn now_unix_ms() -> Result<u128, SpindleError> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis())
 }
 
 pub(crate) fn validate_name(field: &'static str, value: &str) -> Result<(), SpindleError> {

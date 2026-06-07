@@ -20,7 +20,9 @@
 たとえば公式拡張を組み合わせると、次の流れを構成できます。
 
 ```text
-aerospace.workspace.changed
+aerospace.workspace.changed / aerospace.monitor.changed
+  -> workspace-indicator.workspaces.schedule
+  -> extension-owned latest-wins scheduler
   -> aerospace.workspace.snapshot
   -> workspace-indicator.workspaces.render
   -> workspace-indicator.sketchybar.message.requested
@@ -31,7 +33,7 @@ sketchybar.workspace.clicked
 ```
 
 この構成では、`AeroSpace` 拡張は AeroSpace IPC だけを扱い、`SketchyBar` 拡張は SketchyBar IPC だけを扱います。
-ワークスペース表示の色・ラベル・キャッシュキーなどの投影ロジックは `workspace-indicator` 拡張が持ちます。
+ワークスペース表示の色・ラベル・キャッシュキーなどの投影ロジックと、rapid switching 時に中間状態を捨てる latest-wins debounce 方針は `workspace-indicator` 拡張の scheduler が持ちます。
 
 ## カーネルが持つ責務
 
@@ -43,6 +45,7 @@ sketchybar.workspace.clicked
 - stdio JSONL 拡張ホストの登録・起動・再利用
 - 拡張が宣言する event/action/capability surface の所有権チェック
 - capability policy による direct invoke / route grant の制御
+- capability-scoped continuation handle による extension の deferred work
 - アクション出力イベントの再帰 dispatch（深さ上限あり）
 
 ## カーネルに含めないもの（ネガティブスペース）
@@ -388,7 +391,7 @@ ExtensionRegistration::new()
     )
 ```
 
-ルートは event から action への小さな接続です。
+ルートは event から action への小さな接続です。capability を grant する route は `source` 必須です。dispatch 時は、イベント payload と route の static `args` が object として merge されます。同じ key がある場合は route の `args` が優先されます。
 
 ```json
 {
@@ -400,7 +403,11 @@ ExtensionRegistration::new()
 }
 ```
 
-capability を grant する route は `source` 必須です。dispatch 時は、イベント payload と route の static `args` が object として merge されます。同じ key がある場合は route の `args` が優先されます。
+## 非同期 continuation
+
+route/direct invocation で拡張 action を呼ぶとき、daemon は `ActionContext` に短命の `ContinuationContext` を渡します。拡張は action response をすぐ返したあとでも、この handle を使って daemon socket に `continuation-invoke` / `continuation-emit` を送れます。
+
+continuation は original invocation の capability grant に限定され、core が handle identity・origin extension・expiry・required capability を検証します。無効・期限切れ・capability 不足の continuation work は fail closed します。continuation-backed invoke は `action.requested` event に continuation provenance を記録します。
 
 ## stdio JSONL 拡張ホスト
 
@@ -418,6 +425,7 @@ capability を grant する route は `source` 必須です。dispatch 時は、
 
 `ActionContext::extension()` には daemon が見ている installed surface が入ります。
 workflow 拡張はこれを使って、必要な provider event や action があるかを実行時に確認できます。
+`ActionContext::continuation()` には、deferred work を行うための短命 continuation handle が入ります。
 
 ## 公式拡張
 

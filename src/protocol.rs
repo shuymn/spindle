@@ -53,6 +53,30 @@ pub enum HubRequest {
         #[serde(default = "empty_object")]
         args: Value,
     },
+    /// Invoke an action through a core-validated continuation handle.
+    ContinuationInvoke {
+        /// Opaque continuation identifier.
+        continuation: String,
+        /// Action name.
+        action: String,
+        /// Action arguments.
+        #[serde(default = "empty_object")]
+        args: Value,
+    },
+    /// Emit an extension-produced event through a core-validated continuation handle.
+    ContinuationEmit {
+        /// Opaque continuation identifier.
+        continuation: String,
+        /// Event type.
+        #[serde(rename = "type")]
+        kind: String,
+        /// Optional event subject.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        subject: Option<String>,
+        /// Event payload.
+        #[serde(default = "empty_object")]
+        data: Value,
+    },
     /// Validate an extension manifest.
     ValidateExtension {
         /// Manifest path.

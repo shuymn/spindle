@@ -1,8 +1,9 @@
 use serde_json::Value;
 
 use crate::{
-    ActionRequest, Dispatcher, Event, EventFilter, EventLog, ExtensionManifest, ExtensionRegistry,
-    ExtensionRuntimeHost, HubRequest, SpindleError, policy::CapabilityPolicy,
+    ActionRequest, ContinuationAudit, ContinuationConfig, Dispatcher, Event, EventFilter, EventLog,
+    ExtensionManifest, ExtensionRegistry, ExtensionRuntimeHost, HubRequest, SpindleError,
+    dispatch::ensure_produced_event, policy::CapabilityPolicy,
 };
 
 /// Execute one hub request against local kernel state.
@@ -17,10 +18,27 @@ pub fn execute_request(
     registry: &ExtensionRegistry,
     runtime: &ExtensionRuntimeHost,
 ) -> Result<Value, SpindleError> {
+    execute_request_with_continuations(request, log, registry, runtime, None)
+}
+
+/// Execute one hub request with continuation support enabled.
+///
+/// # Errors
+///
+/// Returns an error if validation, policy checks, I/O, extension dispatch, or
+/// JSON serialization fails.
+pub fn execute_request_with_continuations(
+    request: HubRequest,
+    log: &EventLog,
+    registry: &ExtensionRegistry,
+    runtime: &ExtensionRuntimeHost,
+    continuation: Option<&ContinuationConfig>,
+) -> Result<Value, SpindleError> {
     let state = HandlerState {
         log,
         registry,
         runtime,
+        continuation,
     };
     match request {
         HubRequest::Emit {
@@ -40,6 +58,17 @@ pub fn execute_request(
             capabilities,
             args,
         } => invoke_action(&action, source, capabilities, &args, &state),
+        HubRequest::ContinuationInvoke {
+            continuation,
+            action,
+            args,
+        } => continuation_invoke(&continuation, &action, &args, &state),
+        HubRequest::ContinuationEmit {
+            continuation,
+            kind,
+            subject,
+            data,
+        } => continuation_emit(&continuation, kind, subject, data, &state),
         HubRequest::ValidateExtension { manifest } => {
             let manifest = ExtensionManifest::from_path(&manifest)?;
             Ok(serde_json::to_value(manifest)?)
@@ -63,6 +92,7 @@ struct HandlerState<'a> {
     log: &'a EventLog,
     registry: &'a ExtensionRegistry,
     runtime: &'a ExtensionRuntimeHost,
+    continuation: Option<&'a ContinuationConfig>,
 }
 
 fn emit_event(
@@ -78,12 +108,21 @@ fn emit_event(
         .subject(subject)
         .data(data)
         .build()?;
-    state.log.append(&event)?;
-    let dispatches =
-        Dispatcher::with_log(state.registry, state.log, state.runtime).dispatch_event(&event)?;
+    append_and_dispatch_event(&event, state.continuation, state)
+}
+
+fn append_and_dispatch_event(
+    event: &Event,
+    continuation: Option<&ContinuationConfig>,
+    state: &HandlerState<'_>,
+) -> Result<Value, SpindleError> {
+    state.log.append(event)?;
+    let reports = Dispatcher::with_log(state.registry, state.log, state.runtime)
+        .with_continuation_config(continuation)
+        .dispatch_event(event)?;
     Ok(serde_json::json!({
         "event": event,
-        "dispatches": dispatches
+        "dispatches": reports
     }))
 }
 
@@ -111,20 +150,112 @@ fn invoke_action(
     let policy = CapabilityPolicy::load(state_dir_for_log(state.log))?;
     policy.ensure_direct_grants(&source, &capabilities)?;
     let granted_capabilities = capabilities.clone();
+    record_and_dispatch_action_request(
+        ActionDispatchRequest {
+            action,
+            requested_by: source,
+            capabilities,
+            dispatch_capabilities: &granted_capabilities,
+            args,
+            continuation_audit: None,
+            continuation: state.continuation,
+        },
+        state,
+    )
+}
+
+struct ActionDispatchRequest<'a> {
+    action: &'a str,
+    requested_by: String,
+    capabilities: Vec<String>,
+    dispatch_capabilities: &'a [String],
+    args: &'a Value,
+    continuation_audit: Option<ContinuationAudit>,
+    continuation: Option<&'a ContinuationConfig>,
+}
+
+fn record_and_dispatch_action_request(
+    request: ActionDispatchRequest<'_>,
+    state: &HandlerState<'_>,
+) -> Result<Value, SpindleError> {
     let event = ActionRequest {
-        action: String::from(action),
-        requested_by: source,
-        capabilities,
-        args: args.clone(),
+        action: String::from(request.action),
+        requested_by: request.requested_by,
+        capabilities: request.capabilities,
+        args: request.args.clone(),
+        continuation: request.continuation_audit,
     }
     .into_event()?;
     state.log.append(&event)?;
-    let dispatches = Dispatcher::with_log(state.registry, state.log, state.runtime)
-        .dispatch_action(action, args, &granted_capabilities)?;
+    let reports = Dispatcher::with_log(state.registry, state.log, state.runtime)
+        .with_continuation_config(request.continuation)
+        .dispatch_action(request.action, request.args, request.dispatch_capabilities)?;
     Ok(serde_json::json!({
         "event": event,
-        "dispatches": dispatches
+        "dispatches": reports
     }))
+}
+
+fn continuation_invoke(
+    continuation_id: &str,
+    action: &str,
+    args: &Value,
+    state: &HandlerState<'_>,
+) -> Result<Value, SpindleError> {
+    let Some(continuation) = state.continuation else {
+        return Err(SpindleError::ContinuationInvalid);
+    };
+    let grant = continuation.store.validate(continuation_id)?;
+    record_and_dispatch_action_request(
+        ActionDispatchRequest {
+            action,
+            requested_by: format!("{}:continuation", grant.extension),
+            capabilities: grant.capabilities.clone(),
+            dispatch_capabilities: &grant.capabilities,
+            args,
+            continuation_audit: Some(ContinuationAudit {
+                id: grant.id,
+                extension: grant.extension,
+                action: grant.action,
+            }),
+            continuation: Some(continuation),
+        },
+        state,
+    )
+}
+
+fn continuation_emit(
+    continuation_id: &str,
+    kind: String,
+    subject: Option<String>,
+    data: Value,
+    state: &HandlerState<'_>,
+) -> Result<Value, SpindleError> {
+    let Some(continuation) = state.continuation else {
+        return Err(SpindleError::ContinuationInvalid);
+    };
+    let grant = continuation.store.validate(continuation_id)?;
+    let policy = CapabilityPolicy::load(state_dir_for_log(state.log))?;
+    policy.ensure_emit(&grant.extension, &kind)?;
+    ensure_continuation_emit_allowed(state.registry, &grant.extension, &kind)?;
+    let event = Event::builder(kind, grant.extension)
+        .subject(subject)
+        .data(data)
+        .build()?;
+    append_and_dispatch_event(&event, Some(continuation), state)
+}
+
+fn ensure_continuation_emit_allowed(
+    registry: &ExtensionRegistry,
+    extension_id: &str,
+    kind: &str,
+) -> Result<(), SpindleError> {
+    let extension = registry
+        .list()?
+        .into_iter()
+        .find(|extension| extension.id == extension_id)
+        .ok_or(SpindleError::ContinuationInvalid)?;
+    ensure_produced_event(&extension, "continuation.emit", kind)
 }
 
 fn state_dir_for_log(log: &EventLog) -> &std::path::Path {
@@ -133,11 +264,12 @@ fn state_dir_for_log(log: &EventLog) -> &std::path::Path {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, fs};
+    use std::{collections::BTreeMap, fs, time::Duration};
 
     use serde_json::json;
 
     use super::*;
+    use crate::{ContinuationGrantRequest, ContinuationStore};
 
     fn write_capability_policy(
         dir: &std::path::Path,
@@ -371,6 +503,186 @@ done
         )?;
 
         assert_eq!(response["dispatches"][0]["action"], "test.render");
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn continuation_invoke_uses_original_capability_grant() -> Result<(), SpindleError> {
+        let dir = crate::store::tests_support::test_dir()?;
+        fs::create_dir_all(&dir)?;
+        let host = dir.join("continuation-host.sh");
+        crate::store::tests_support::write_executable(
+            &host,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"type":"register"'*)
+      printf '%s\n' '{"type":"registration","registration":{"capabilities":["test.read","test.write"],"actions":{"test.read":{"capabilities":["test.read"]},"test.write":{"capabilities":["test.write"]}}}}'
+      ;;
+    *'"type":"invoke"'*)
+      printf '%s\n' '{"type":"action-output","output":{}}'
+      ;;
+    *'"type":"shutdown"'*)
+      printf '%s\n' '{"type":"shutdown"}'
+      exit 0
+      ;;
+  esac
+done
+"#,
+        )?;
+        let manifest = dir.join("extension.json");
+        fs::write(
+            &manifest,
+            serde_json::to_string_pretty(&json!({
+                "id": "test-host",
+                "version": "0.1.0",
+                "entrypoint": host,
+                "runtime": "stdio-jsonl"
+            }))?,
+        )?;
+        let log = EventLog::in_dir(&dir);
+        let registry = ExtensionRegistry::in_dir(&dir);
+        let runtime = ExtensionRuntimeHost::new();
+        registry.install_manifest_with_runtime(&manifest, &runtime)?;
+        let continuation = ContinuationConfig {
+            store: ContinuationStore::default(),
+            socket: dir.join("spindle.sock"),
+        };
+        let handle = continuation.store.create(
+            "workflow",
+            "workflow.schedule",
+            &[String::from("test.read")],
+            &continuation.socket,
+        )?;
+
+        let response = execute_request_with_continuations(
+            HubRequest::ContinuationInvoke {
+                continuation: handle.id,
+                action: String::from("test.read"),
+                args: json!({}),
+            },
+            &log,
+            &registry,
+            &runtime,
+            Some(&continuation),
+        )?;
+
+        assert_eq!(response["dispatches"][0]["action"], "test.read");
+        assert_eq!(
+            response["event"]["data"]["continuation"]["extension"],
+            "workflow"
+        );
+        runtime.shutdown()?;
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn continuation_invoke_rejects_ungranted_capability() -> Result<(), SpindleError> {
+        let dir = crate::store::tests_support::test_dir()?;
+        fs::create_dir_all(&dir)?;
+        let host = dir.join("continuation-deny-host.sh");
+        crate::store::tests_support::write_executable(
+            &host,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"type":"register"'*)
+      printf '%s\n' '{"type":"registration","registration":{"capabilities":["test.write"],"actions":{"test.write":{"capabilities":["test.write"]}}}}'
+      ;;
+    *'"type":"invoke"'*)
+      printf '%s\n' '{"type":"action-output","output":{}}'
+      ;;
+    *'"type":"shutdown"'*)
+      printf '%s\n' '{"type":"shutdown"}'
+      exit 0
+      ;;
+  esac
+done
+"#,
+        )?;
+        let manifest = dir.join("extension.json");
+        fs::write(
+            &manifest,
+            serde_json::to_string_pretty(&json!({
+                "id": "test-host",
+                "version": "0.1.0",
+                "entrypoint": host,
+                "runtime": "stdio-jsonl"
+            }))?,
+        )?;
+        let log = EventLog::in_dir(&dir);
+        let registry = ExtensionRegistry::in_dir(&dir);
+        let runtime = ExtensionRuntimeHost::new();
+        registry.install_manifest_with_runtime(&manifest, &runtime)?;
+        let continuation = ContinuationConfig {
+            store: ContinuationStore::default(),
+            socket: dir.join("spindle.sock"),
+        };
+        let handle = continuation.store.create(
+            "workflow",
+            "workflow.schedule",
+            &[String::from("test.read")],
+            &continuation.socket,
+        )?;
+
+        let denied = execute_request_with_continuations(
+            HubRequest::ContinuationInvoke {
+                continuation: handle.id,
+                action: String::from("test.write"),
+                args: json!({}),
+            },
+            &log,
+            &registry,
+            &runtime,
+            Some(&continuation),
+        );
+
+        assert!(matches!(
+            denied,
+            Err(SpindleError::MissingActionCapability { .. })
+        ));
+        runtime.shutdown()?;
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn expired_continuation_fails_closed() -> Result<(), SpindleError> {
+        let dir = crate::store::tests_support::test_dir()?;
+        fs::create_dir_all(&dir)?;
+        let log = EventLog::in_dir(&dir);
+        let registry = ExtensionRegistry::in_dir(&dir);
+        let runtime = ExtensionRuntimeHost::new();
+        let continuation = ContinuationConfig {
+            store: ContinuationStore::default(),
+            socket: dir.join("spindle.sock"),
+        };
+        let capabilities = [String::from("test.read")];
+        let handle = continuation
+            .store
+            .create_with_lifetime(ContinuationGrantRequest {
+                extension: "workflow",
+                action: "workflow.schedule",
+                capabilities: &capabilities,
+                socket: &continuation.socket,
+                ttl: Duration::from_millis(0),
+            })?;
+
+        let denied = execute_request_with_continuations(
+            HubRequest::ContinuationInvoke {
+                continuation: handle.id,
+                action: String::from("test.read"),
+                args: json!({}),
+            },
+            &log,
+            &registry,
+            &runtime,
+            Some(&continuation),
+        );
+
+        assert!(matches!(denied, Err(SpindleError::ContinuationExpired)));
         fs::remove_dir_all(dir)?;
         Ok(())
     }
