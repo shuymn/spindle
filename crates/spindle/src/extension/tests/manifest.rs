@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn manifest_requires_action_capabilities_to_be_declared() {
+fn manifest_allows_action_capabilities_without_providing_them() -> Result<(), SpindleError> {
     let mut actions = BTreeMap::new();
     actions.insert(
         String::from("sketchybar.render"),
@@ -22,7 +22,8 @@ fn manifest_requires_action_capabilities_to_be_declared() {
         routes: Vec::new(),
     };
 
-    assert!(manifest.validate().is_err());
+    manifest.validate()?;
+    Ok(())
 }
 
 #[test]

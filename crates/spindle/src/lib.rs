@@ -54,15 +54,6 @@ pub enum SpindleError {
         reason: &'static str,
     },
 
-    /// A manifest action requested a capability not declared by the extension.
-    #[error("action {action} requires undeclared capability {capability}")]
-    UndeclaredCapability {
-        /// Action name.
-        action: String,
-        /// Missing capability.
-        capability: String,
-    },
-
     /// A dispatch request did not grant a capability required by an action.
     #[error("action {action} requires capability {capability}")]
     MissingActionCapability {

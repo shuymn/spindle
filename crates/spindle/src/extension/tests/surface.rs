@@ -138,6 +138,60 @@ fn registry_rejects_capability_surface_conflicts() -> Result<(), SpindleError> {
 }
 
 #[test]
+fn registry_allows_consumer_action_capabilities_from_provider() -> Result<(), SpindleError> {
+    let dir = crate::store::tests_support::test_dir()?;
+    fs::create_dir_all(&dir)?;
+
+    let provider = ExtensionManifest {
+        id: String::from("aerospace"),
+        version: String::from("0.1.0"),
+        entrypoint: None,
+        runtime: ExtensionRuntime::Recipe,
+        emits: Vec::new(),
+        produces: Vec::new(),
+        capabilities: vec![String::from("aerospace.state.read")],
+        actions: BTreeMap::new(),
+        routes: Vec::new(),
+    };
+    let mut consumer_actions = BTreeMap::new();
+    consumer_actions.insert(
+        String::from("workspace-indicator.render"),
+        ExtensionAction {
+            capabilities: vec![
+                String::from("aerospace.state.read"),
+                String::from("aerospace.window.control"),
+                String::from("sketchybar.ui.write"),
+            ],
+        },
+    );
+    let consumer = ExtensionManifest {
+        id: String::from("workspace-indicator"),
+        version: String::from("0.1.0"),
+        entrypoint: Some(String::from("./bin/extension")),
+        runtime: ExtensionRuntime::StdioJsonl,
+        emits: Vec::new(),
+        produces: Vec::new(),
+        capabilities: Vec::new(),
+        actions: consumer_actions,
+        routes: Vec::new(),
+    };
+
+    let provider_path = dir.join("aerospace.json");
+    let consumer_path = dir.join("workspace-indicator.json");
+    fs::write(&provider_path, serde_json::to_string_pretty(&provider)?)?;
+    fs::write(&consumer_path, serde_json::to_string_pretty(&consumer)?)?;
+
+    let registry = ExtensionRegistry::in_dir(&dir);
+    registry.register_manifest(&provider_path)?;
+    registry.register_manifest(&consumer_path)?;
+
+    let extensions = registry.list()?;
+    assert_eq!(extensions.len(), 2);
+    fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[test]
 fn registry_serializes_concurrent_installs() -> Result<(), SpindleError> {
     let dir = crate::store::tests_support::test_dir()?;
     fs::create_dir_all(&dir)?;

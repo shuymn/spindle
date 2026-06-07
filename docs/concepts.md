@@ -34,7 +34,7 @@ Provider extensions handle external protocols. Workflow extensions own projectio
 - Direct action execution and `action.requested` logging via `invoke`
 - Extension manifest validation
 - Registration, startup, and reuse of stdio JSONL extension hosts
-- Ownership checks for extension-declared event/action/capability surfaces
+- Ownership checks for extension-declared event/action surfaces and provided capabilities
 - Direct invoke and route grant control through capability policy
 - Capability-scoped continuation handles for deferred extension work
 - Recursive dispatch of action output events, with a depth limit

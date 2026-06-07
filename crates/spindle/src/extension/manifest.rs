@@ -161,18 +161,11 @@ impl ExtensionManifest {
         }
         validate_unique_values("capabilities", &self.capabilities)?;
 
-        let declared = self.capabilities.iter().collect::<BTreeSet<_>>();
         for (action, definition) in &self.actions {
             validate_name("action", action)?;
             validate_unique_values("action.capabilities", &definition.capabilities)?;
             for capability in &definition.capabilities {
                 validate_name("capability", capability)?;
-                if !declared.contains(capability) {
-                    return Err(SpindleError::UndeclaredCapability {
-                        action: action.clone(),
-                        capability: capability.clone(),
-                    });
-                }
             }
         }
 
