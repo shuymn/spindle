@@ -9,8 +9,9 @@ use clap::{Args, Parser, Subcommand};
 use serde_json::Value;
 
 use crate::{
-    EventFilter, EventLog, ExtensionManifest, ExtensionRegistry, ExtensionRuntimeHost, HubRequest,
-    SpindleError, execute_request, send_request, serve, validate_json_object,
+    CapabilityPolicy, EventFilter, EventLog, ExtensionManifest, ExtensionRegistry,
+    ExtensionRuntimeHost, HubRequest, SpindleError, execute_request, send_request, serve,
+    validate_extension_routes, validate_json_object,
 };
 
 /// Run the spindle command-line interface.
@@ -57,6 +58,8 @@ enum Command {
     Invoke(InvokeArgs),
     /// Work with extension manifests.
     Extension(ExtensionCommand),
+    /// Work with capability policy.
+    Policy(PolicyCommand),
 }
 
 #[derive(Debug, Args)]
@@ -131,6 +134,18 @@ struct QueryEventsArgs {
 struct ExtensionCommand {
     #[command(subcommand)]
     command: ExtensionSubcommand,
+}
+
+#[derive(Debug, Args)]
+struct PolicyCommand {
+    #[command(subcommand)]
+    command: PolicySubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum PolicySubcommand {
+    /// Validate capability policy against installed extensions.
+    Validate,
 }
 
 #[derive(Debug, Subcommand)]
@@ -270,6 +285,17 @@ fn run_cli(cli: Cli) -> Result<()> {
         }) => {
             let extensions = registry.list()?;
             write_json(&extensions)?;
+        }
+        Command::Policy(PolicyCommand {
+            command: PolicySubcommand::Validate,
+        }) => {
+            let policy = CapabilityPolicy::load(&state_dir)?;
+            let extensions = registry.list()?;
+            for extension in &extensions {
+                validate_extension_routes(extension, &extensions, &policy)?;
+            }
+            policy.validate_against_extensions(&extensions)?;
+            write_json(&policy)?;
         }
     }
 
@@ -420,6 +446,68 @@ mod tests {
         });
 
         assert!(result.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn policy_validate_cli_succeeds_for_installed_extensions() -> Result<()> {
+        let dir = crate::store::tests_support::test_dir()?;
+        fs::create_dir_all(&dir)?;
+        let workflow_manifest = dir.join("workflow.json");
+        fs::write(
+            &workflow_manifest,
+            r#"{
+          "id": "workflow",
+          "version": "0.1.0",
+          "runtime": "recipe",
+          "routes": [
+            {
+              "event": "provider.changed",
+              "source": "provider",
+              "action": "provider.snapshot",
+              "capabilities": ["provider.read"]
+            }
+          ]
+        }"#,
+        )?;
+        let provider_host = dir.join("provider-host.sh");
+        crate::store::tests_support::write_executable(&provider_host, "#!/bin/sh\nexit 0\n")?;
+        let provider_manifest = dir.join("provider.json");
+        fs::write(
+            &provider_manifest,
+            format!(
+                r#"{{
+          "id": "provider",
+          "version": "0.1.0",
+          "entrypoint": "{}",
+          "runtime": "stdio-jsonl",
+          "emits": ["provider.changed"],
+          "actions": {{
+            "provider.snapshot": {{
+              "capabilities": []
+            }}
+          }}
+        }}"#,
+                provider_host.display()
+            ),
+        )?;
+        crate::store::tests_support::write_capability_policy(
+            &dir,
+            r#"{"emits":{"provider":["provider.changed"]},"direct":{},"routes":{"workflow":[{"source":"provider","event":"provider.changed","capabilities":["provider.read"]}]}}"#,
+        )?;
+
+        let registry = ExtensionRegistry::in_dir(&dir);
+        registry.register_manifest(&provider_manifest)?;
+        registry.register_manifest(&workflow_manifest)?;
+
+        run_cli(Cli {
+            state_dir: Some(dir.clone()),
+            command: Command::Policy(PolicyCommand {
+                command: PolicySubcommand::Validate,
+            }),
+        })?;
+
+        fs::remove_dir_all(dir)?;
         Ok(())
     }
 

@@ -18,7 +18,7 @@ use super::{
 };
 use crate::{
     CapabilityPolicy, ExtensionRuntimeHost, SpindleError, lock::SidecarLock,
-    store::ensure_private_state_parent,
+    policy::validate_extension_routes, store::ensure_private_state_parent,
 };
 
 /// Registered extension metadata stored by the spindle kernel.
@@ -216,8 +216,10 @@ impl ExtensionRegistry {
         let _lock = SidecarLock::acquire(&self.path)?;
         let mut entries = self.list()?;
         entries.retain(|entry| entry.id != registered.id);
-        ensure_surface_ownership(&registered, &entries)?;
         entries.push(registered.clone());
+        validate_extension_routes(&registered, &entries, &policy)?;
+        // `registered` is the last element until the sort below, so the prefix is the existing set.
+        ensure_surface_ownership(&registered, &entries[..entries.len() - 1])?;
         entries.sort_by(|left, right| left.id.cmp(&right.id));
         self.write_entries(&entries)?;
 

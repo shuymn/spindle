@@ -15,6 +15,8 @@ Validate a manifest without starting the extension host.
 cargo run -p spindle -- extension validate /path/to/my-extension/extension.json
 ```
 
+When an extension route references events or actions owned by another extension, install the provider extension first. Route validation runs at install time and checks that referenced sources, events, and actions exist in the registry.
+
 `extension validate` reads only the static manifest and does not run the entrypoint. `install` / `extension register` register only the static manifest surface by default.
 
 For a `stdio-jsonl` extension, pass `--trust-runtime` when you want to start the entrypoint and receive dynamic surface from the `register` request. `--trust-runtime` executes the entrypoint for dynamic surface discovery and records the current entrypoint path / SHA-256 in the registry. To inspect dynamic surface without writing the registry, use `extension surface --trust-runtime <manifest>`.
@@ -44,6 +46,8 @@ cargo run -p spindle -- install crates/spindle-extension-example
 Event/action/capability surface can be written statically in the manifest, but `stdio-jsonl` extensions usually register it from extension code through the SDK.
 
 `emits` are event kinds an extension may observe from external input or IPC and emit. `produces` are event kinds an extension action may return in `ActionOutput`. Both are treated as event surface ownership, so two extensions cannot register the same event kind through either `emits` or `produces`.
+
+Top-level `capabilities` declare capabilities an extension **provides** and owns. Action `capabilities` declare capabilities an action **requires** at invoke time. Required capabilities may come from routes, direct invokes, or continuations; they do not need to appear in the provider extension's top-level `capabilities` list. Consumer extensions can require provider capabilities in action metadata without claiming ownership of those capabilities.
 
 ```rust
 ExtensionRegistration::new()

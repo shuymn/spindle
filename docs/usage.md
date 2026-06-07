@@ -110,6 +110,42 @@ Route capabilities are checked both during dispatch and when an extension is ins
 
 `capabilities.json` is local grant policy. If you create it manually, keep it private with `chmod 600 "$SPINDLE_STATE_DIR/capabilities.json"`.
 
+Validate policy shape and route references against installed extensions before daemon startup:
+
+```bash
+cargo run -p spindle -- policy validate
+```
+
+Route grant entries must be objects with `source`, `event`, and `capabilities`. Legacy string-only capability lists are rejected:
+
+```json
+{
+  "routes": {
+    "workspace-indicator": [
+      "aerospace.state.read"
+    ]
+  }
+}
+```
+
+Migrate that shape to:
+
+```json
+{
+  "routes": {
+    "workspace-indicator": [
+      {
+        "source": "aerospace",
+        "event": "aerospace.workspace.changed",
+        "capabilities": ["aerospace.state.read"]
+      }
+    ]
+  }
+}
+```
+
+Extension install and `policy validate` also check that route `event` values and policy grant `source`/`event` pairs match installed extension surfaces.
+
 Example direct action invocation:
 
 ```bash

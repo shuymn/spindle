@@ -1,13 +1,12 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::File,
-    io::BufReader,
+    fs,
     path::Path,
 };
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ExtensionRoute, RegisteredExtension, SpindleError, validate_name};
+use crate::{ExtensionRoute, ExtensionRuntime, RegisteredExtension, SpindleError, validate_name};
 
 const POLICY_FILE: &str = "capabilities.json";
 const WILDCARD: &str = "*";
@@ -42,11 +41,69 @@ impl CapabilityPolicy {
             return Ok(policy);
         }
 
-        let file = File::open(path)?;
-        let reader = BufReader::new(file);
-        let policy = serde_json::from_reader::<_, Self>(reader)?;
+        let contents = fs::read_to_string(path)?;
+        let value: serde_json::Value = serde_json::from_str(&contents)?;
+        detect_legacy_route_policy(&value)?;
+        let policy: Self = serde_json::from_value(value)?;
         policy.validate()?;
         Ok(policy)
+    }
+
+    /// Validate route grant policy against installed extension surfaces.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a grantor, source, event, or grant entry does not
+    /// match an installed extension route.
+    pub fn validate_against_extensions(
+        &self,
+        extensions: &[RegisteredExtension],
+    ) -> Result<(), SpindleError> {
+        for (grantor, grants) in &self.routes {
+            let grantor_extension = extensions
+                .iter()
+                .find(|extension| extension.id == *grantor)
+                .ok_or_else(|| SpindleError::UnknownPolicyGrantor {
+                    grantor: grantor.clone(),
+                })?;
+            for grant in grants {
+                if grant.source != WILDCARD
+                    && !route_source_is_valid(&grant.source, &grant.event, extensions, self)
+                {
+                    return Err(SpindleError::UnknownPolicyGrantSource {
+                        grantor: grantor.clone(),
+                        grant_source: grant.source.clone(),
+                    });
+                }
+                if grant.event != WILDCARD
+                    && !route_event_is_known(
+                        &grant.event,
+                        Some(grant.source.as_str()),
+                        extensions,
+                        self,
+                    )
+                {
+                    return Err(SpindleError::UnknownPolicyGrantEvent {
+                        grantor: grantor.clone(),
+                        event: grant.event.clone(),
+                    });
+                }
+                if grant.source != WILDCARD
+                    && grant.event != WILDCARD
+                    && !grantor_extension
+                        .routes
+                        .iter()
+                        .any(|route| route_matches_policy_route(route, &grant.source, &grant.event))
+                {
+                    return Err(SpindleError::OrphanPolicyGrant {
+                        grantor: grantor.clone(),
+                        grant_source: grant.source.clone(),
+                        event: grant.event.clone(),
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Ensure a direct event source may emit one event kind.
@@ -143,6 +200,122 @@ impl CapabilityPolicy {
         validate_policy_map("direct", &self.direct)?;
         validate_route_policy_map("routes", &self.routes)
     }
+}
+
+/// Validate one extension's routes against installed extension surfaces.
+///
+/// # Errors
+///
+/// Returns an error when a route references an unknown event, source, or action.
+pub fn validate_extension_routes(
+    extension: &RegisteredExtension,
+    extensions: &[RegisteredExtension],
+    policy: &CapabilityPolicy,
+) -> Result<(), SpindleError> {
+    let actions = routable_actions(extensions);
+    for route in &extension.routes {
+        if !route_event_is_known(&route.event, route.source.as_deref(), extensions, policy) {
+            return Err(SpindleError::UnknownRouteEvent {
+                extension: extension.id.clone(),
+                event: route.event.clone(),
+            });
+        }
+        if let Some(source) = &route.source
+            && !route_source_is_valid(source, &route.event, extensions, policy)
+        {
+            return Err(SpindleError::UnknownRouteSource {
+                extension: extension.id.clone(),
+                route_source: source.clone(),
+            });
+        }
+        if !actions.contains(route.action.as_str()) {
+            return Err(SpindleError::UnknownRouteAction {
+                extension: extension.id.clone(),
+                action: route.action.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn routable_actions(extensions: &[RegisteredExtension]) -> BTreeSet<&str> {
+    extensions
+        .iter()
+        .filter(|extension| extension.runtime != ExtensionRuntime::Recipe)
+        .flat_map(|extension| extension.actions.keys().map(String::as_str))
+        .collect()
+}
+
+fn route_event_is_known(
+    event: &str,
+    source: Option<&str>,
+    extensions: &[RegisteredExtension],
+    policy: &CapabilityPolicy,
+) -> bool {
+    if extensions
+        .iter()
+        .any(|extension| extension_owns_event(extension, event))
+    {
+        return true;
+    }
+    source.map_or_else(
+        || {
+            policy.emits.values().any(|events| {
+                events
+                    .iter()
+                    .any(|allowed| allowed == event || allowed == WILDCARD)
+            })
+        },
+        |source| is_allowed(&policy.emits, source, event),
+    )
+}
+
+fn route_source_is_valid(
+    source: &str,
+    event: &str,
+    extensions: &[RegisteredExtension],
+    policy: &CapabilityPolicy,
+) -> bool {
+    if let Some(owner) = extensions.iter().find(|extension| extension.id == source) {
+        return extension_owns_event(owner, event);
+    }
+    is_allowed(&policy.emits, source, event)
+}
+
+fn extension_owns_event(extension: &RegisteredExtension, event: &str) -> bool {
+    extension.emits.iter().any(|kind| kind == event)
+        || extension.produces.iter().any(|kind| kind == event)
+}
+
+fn route_matches_policy_route(
+    route: &ExtensionRoute,
+    grant_source: &str,
+    grant_event: &str,
+) -> bool {
+    if !value_matches(grant_event, &route.event) {
+        return false;
+    }
+    route
+        .source
+        .as_deref()
+        .is_none_or(|route_source| value_matches(grant_source, route_source))
+}
+
+fn detect_legacy_route_policy(value: &serde_json::Value) -> Result<(), SpindleError> {
+    let Some(routes) = value.get("routes").and_then(serde_json::Value::as_object) else {
+        return Ok(());
+    };
+    for (grantor, grants) in routes {
+        let Some(array) = grants.as_array() else {
+            continue;
+        };
+        if array.iter().any(serde_json::Value::is_string) {
+            return Err(SpindleError::LegacyRouteGrantPolicy {
+                grantor: grantor.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn ensure_grants(
@@ -250,9 +423,10 @@ fn value_matches(pattern: &str, value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, path::PathBuf};
 
     use super::*;
+    use crate::ExtensionAction;
 
     #[test]
     fn default_policy_denies_route_grants() {
@@ -392,6 +566,172 @@ mod tests {
         );
     }
 
+    #[test]
+    fn policy_rejects_legacy_route_grant_shape() -> Result<(), SpindleError> {
+        let dir = crate::store::tests_support::test_dir()?;
+        fs::create_dir_all(&dir)?;
+        fs::write(
+            dir.join(POLICY_FILE),
+            r#"{"routes":{"workspace-indicator":["aerospace.state.read"]}}"#,
+        )?;
+
+        let result = CapabilityPolicy::load(&dir);
+
+        assert!(matches!(
+            result,
+            Err(SpindleError::LegacyRouteGrantPolicy { .. })
+        ));
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn validate_extension_routes_rejects_unknown_source() {
+        let provider = registered_extension(
+            "aerospace",
+            &["aerospace.workspace.changed"],
+            &[],
+            &[("workspace-indicator.render", ExtensionAction::default())],
+            &[],
+        );
+        let consumer = registered_extension(
+            "workspace-indicator",
+            &[],
+            &[],
+            &[],
+            &[ExtensionRoute {
+                event: String::from("aerospace.workspace.changed"),
+                source: Some(String::from("nonexistent-extension")),
+                action: String::from("workspace-indicator.render"),
+                capabilities: Vec::new(),
+                args: serde_json::json!({}),
+            }],
+        );
+
+        let result = validate_extension_routes(
+            &consumer,
+            &[provider, consumer.clone()],
+            &CapabilityPolicy::default(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(SpindleError::UnknownRouteSource { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_extension_routes_rejects_unknown_action() {
+        let provider = registered_extension(
+            "aerospace",
+            &["aerospace.workspace.changed"],
+            &[],
+            &[("workspace-indicator.render", ExtensionAction::default())],
+            &[],
+        );
+        let consumer = registered_extension(
+            "workspace-indicator",
+            &[],
+            &[],
+            &[],
+            &[ExtensionRoute {
+                event: String::from("aerospace.workspace.changed"),
+                source: Some(String::from("aerospace")),
+                action: String::from("nonexistent.action"),
+                capabilities: Vec::new(),
+                args: serde_json::json!({}),
+            }],
+        );
+
+        let result = validate_extension_routes(
+            &consumer,
+            &[provider, consumer.clone()],
+            &CapabilityPolicy::default(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(SpindleError::UnknownRouteAction { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_extension_routes_rejects_unknown_event() {
+        let provider = registered_extension(
+            "aerospace",
+            &["aerospace.workspace.changed"],
+            &[],
+            &[("workspace-indicator.render", ExtensionAction::default())],
+            &[],
+        );
+        let consumer = registered_extension(
+            "workspace-indicator",
+            &[],
+            &[],
+            &[("workspace-indicator.render", ExtensionAction::default())],
+            &[ExtensionRoute {
+                event: String::from("workspace-indicator.rendered"),
+                source: Some(String::from("aerospace")),
+                action: String::from("workspace-indicator.render"),
+                capabilities: Vec::new(),
+                args: serde_json::json!({}),
+            }],
+        );
+
+        let result = validate_extension_routes(
+            &consumer,
+            &[provider, consumer.clone()],
+            &CapabilityPolicy::default(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(SpindleError::UnknownRouteEvent { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_policy_against_extensions_rejects_orphan_grant() {
+        let provider = registered_extension(
+            "aerospace",
+            &["aerospace.workspace.changed", "aerospace.other.changed"],
+            &[],
+            &[],
+            &[],
+        );
+        let consumer = registered_extension(
+            "workspace-indicator",
+            &[],
+            &[],
+            &[("workspace-indicator.render", ExtensionAction::default())],
+            &[ExtensionRoute {
+                event: String::from("aerospace.workspace.changed"),
+                source: Some(String::from("aerospace")),
+                action: String::from("workspace-indicator.render"),
+                capabilities: vec![String::from("aerospace.state.read")],
+                args: serde_json::json!({}),
+            }],
+        );
+        let policy = CapabilityPolicy {
+            routes: BTreeMap::from([(
+                String::from("workspace-indicator"),
+                vec![RouteGrantPolicy {
+                    source: String::from("aerospace"),
+                    event: String::from("aerospace.other.changed"),
+                    capabilities: vec![String::from("aerospace.state.read")],
+                }],
+            )]),
+            ..CapabilityPolicy::default()
+        };
+
+        let result = policy.validate_against_extensions(&[provider, consumer]);
+
+        assert!(matches!(
+            result,
+            Err(SpindleError::OrphanPolicyGrant { .. })
+        ));
+    }
+
     fn route(event: &str, source: &str, capabilities: &[&str]) -> ExtensionRoute {
         ExtensionRoute {
             event: String::from(event),
@@ -402,6 +742,31 @@ mod tests {
                 .map(|capability| String::from(*capability))
                 .collect(),
             args: serde_json::json!({}),
+        }
+    }
+
+    fn registered_extension(
+        id: &str,
+        emits: &[&str],
+        produces: &[&str],
+        actions: &[(&str, ExtensionAction)],
+        routes: &[ExtensionRoute],
+    ) -> RegisteredExtension {
+        RegisteredExtension {
+            id: String::from(id),
+            version: String::from("0.1.0"),
+            manifest_path: PathBuf::from(format!("/tmp/{id}.json")),
+            runtime: ExtensionRuntime::StdioJsonl,
+            entrypoint: Some(String::from("./bin/extension")),
+            capabilities: Vec::new(),
+            emits: emits.iter().map(|event| String::from(*event)).collect(),
+            produces: produces.iter().map(|event| String::from(*event)).collect(),
+            actions: actions
+                .iter()
+                .map(|(name, action)| (String::from(*name), action.clone()))
+                .collect(),
+            routes: routes.to_vec(),
+            runtime_trust: None,
         }
     }
 }

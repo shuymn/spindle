@@ -26,12 +26,34 @@ fn registry_authorizes_installed_route_grants() -> Result<(), SpindleError> {
           ]
         }"#,
     )?;
+    let provider_host = dir.join("provider-host.sh");
+    crate::store::tests_support::write_executable(&provider_host, "#!/bin/sh\nexit 0\n")?;
+    let provider_manifest = dir.join("provider.json");
+    fs::write(
+        &provider_manifest,
+        format!(
+            r#"{{
+          "id": "provider",
+          "version": "0.1.0",
+          "entrypoint": "{}",
+          "runtime": "stdio-jsonl",
+          "emits": ["provider.changed"],
+          "actions": {{
+            "provider.snapshot": {{
+              "capabilities": []
+            }}
+          }}
+        }}"#,
+            provider_host.display()
+        ),
+    )?;
     crate::store::tests_support::write_capability_policy(
         &dir,
-        r#"{"emits":{},"direct":{},"routes":{"workflow":[{"source":"provider","event":"provider.changed","capabilities":["provider.read"]}]}}"#,
+        r#"{"emits":{"provider":["provider.changed"]},"direct":{},"routes":{"workflow":[{"source":"provider","event":"provider.changed","capabilities":["provider.read"]}]}}"#,
     )?;
 
     let registry = ExtensionRegistry::in_dir(&dir);
+    registry.register_manifest(&provider_manifest)?;
     let registered = registry.register_manifest(&manifest_path)?;
     let policy = crate::CapabilityPolicy::load(&dir)?;
 
