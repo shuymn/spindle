@@ -84,7 +84,6 @@ spindle/
 
 - `crates/spindle/` — イベントログ、dispatch、manifest 検証、daemon
 - `crates/spindle-extension-sdk/` — カーネルと拡張ホストが共有する contract 型
-- `crates/spindle/examples/` — ベンチマークと小さな実験用コード
 
 `spindle-extension-sdk` は拡張作者向けのライブラリです。`crates/spindle` は daemon 本体で、SDK に依存して拡張 contract を検証・実行します。
 
@@ -117,15 +116,6 @@ release ビルドでは `spindle` バイナリが `target/release/` に作られ
 ```bash
 cargo build --workspace --release --locked
 ```
-
-stdio dispatch benchmark は、ベンチ対象の stdio 拡張バイナリを明示する必要があります。
-
-```bash
-SPINDLE_BENCH_EXTENSION_BIN=/path/to/bench-extension \
-  cargo run -p spindle --example perf --release
-```
-
-`SPINDLE_BENCH_EXTENSION_BIN` is required for stdio dispatch benchmark. Build a stdio JSONL extension exposing `bench.render` and pass its path via `SPINDLE_BENCH_EXTENSION_BIN`.
 
 ## 基本的な使い方
 
