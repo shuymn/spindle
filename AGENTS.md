@@ -1,24 +1,33 @@
-<!-- Maintenance: Update when tasks, hooks, or project scope changes. -->
-<!-- Audience: All docs under docs/ and this file are written for coding agents (LLMs), not humans. Use direct instructions, not tutorials or explanations of concepts the agent already knows. Apply this rule when creating or updating any documentation. -->
+<!-- Maintenance: update when repository commands, hooks, lint policy, or agent-facing docs change. -->
+<!-- Audience: this file and docs/ are for coding agents. Keep instructions direct and compact. -->
 
-## Build, Test, and Development Commands
+## Non-negotiables
 
-- Use Task ([Taskfile.yml](Taskfile.yml)) as the default interface
-- `task build` / `task test` / `task lint` / `task fmt` / `task check` — primary workflow; `task check` runs formatting check, Clippy, tests, `cargo doc`, and build; `task check:fast` skips tests and docs (see [docs/tooling.md](docs/tooling.md))
-- Rust-native equivalents work without Task: `cargo build`, `cargo test`, `cargo fmt --all`, `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` (same as `task lint`; see [docs/tooling.md](docs/tooling.md) for Clippy policy details)
-- Prefer `cargo add` / editing `Cargo.toml` for dependencies; run `cargo build` or `task build` after manifest changes
-- `unsafe_code` is **forbidden** and `unwrap`/`expect`/`todo`/`dbg!` are **denied** via `Cargo.toml` `[lints]` — applies to all code including tests
+- Use Task as the default command interface.
+  Prefer `task build`, `task test`, `task lint`, `task fmt`, and `task check` over ad-hoc command sequences.
+- Do not use `--no-verify` for commits or pushes. Fix the hook failure.
+- Keep this file limited to always-on repository rules; put detailed guidance in `docs/`.
+- When writing or updating agent-facing docs, use direct instructions instead of tutorials or human-oriented prose.
 
-## Git Conventions
+## Rust work
 
-- When asked to commit without a specific format, follow Conventional Commits: `<type>(<scope>): <imperative summary>`
-- Never use `--no-verify` when committing or pushing; fix the underlying hook failure instead
+- Before modifying Rust code, read `docs/coding.md`.
+- Before modifying tests, read `docs/testing.md`.
+- Before changing build, CI, hooks, toolchain, or adding tools, read `docs/tooling.md`.
+- Before code review work, read `docs/review.md`.
+- Read `docs/adr/` only when historical rationale matters to the task.
+- `unwrap`, `expect`, `todo`, and `dbg!` are denied across the workspace, including tests.
+  Prefer `Result` tests and `?`.
+- `unsafe_code` is forbidden in most crates. The SketchyBar Mach IPC FFI is the narrow exception.
+  Keep unsafe localized, justified nearby, and behind a safe public API.
 
-## Documentation Scope
+## Commands
 
-<!-- Keep this file limited to always-on repository rules. -->
-- Read `docs/coding.md` before writing or modifying any Rust code.
-- Read `docs/testing.md` before writing or modifying tests.
-- Read `docs/tooling.md` when working with build, CI, hooks, or adding tools.
-- Read `docs/review.md` when performing code review.
-- Read `docs/adr/` only when historical rationale matters.
+- Full local verification: `task check`.
+- Fast verification without tests/docs: `task check:fast`.
+- Rust-native equivalents are acceptable when Task is unavailable:
+  - `cargo build --workspace --locked`
+  - `cargo test --workspace --all-targets --all-features --locked`
+  - `cargo fmt --all`
+  - `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
+- After changing `Cargo.toml`, run `task build` or `cargo build --workspace --locked`.

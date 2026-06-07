@@ -99,6 +99,7 @@ Read this file before writing or modifying any Rust code in this repository.
 - **Initialize-then-populate** — construct objects fully initialized with constructors or builders.
 - **Manual index loops** — prefer iterators. They eliminate off-by-one errors and often generate better machine code.
 - **Using `unsafe` to fight the borrow checker** — refactor the code instead.
+- **Unexplained unsafe for performance** — performance-critical unsafe is allowed only when measurement or a clear platform constraint justifies it, the unsafe scope is localized to the smallest module, a nearby comment states the reason, and the public API remains safe.
 - **Defaulting to `Box<dyn Trait>`** — use generics when the concrete type is statically known. Do not reach for trait objects solely for dependency injection.
 - **Excessive `impl Into<T>` parameters** — if callers use only one or two types, accept `String` or `&str` directly. The added genericity rarely justifies the API complexity.
 - **Hand-written enum-to-string match** — use derive macros like `strum` to automate variant name conversions instead of maintaining match arms manually.
