@@ -28,7 +28,7 @@ pub struct DispatchReport {
 pub struct Dispatcher<'a> {
     registry: &'a ExtensionRegistry,
     log: Option<&'a EventLog>,
-    runtime: &'a mut ExtensionRuntimeHost,
+    runtime: &'a ExtensionRuntimeHost,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -64,10 +64,7 @@ struct ExtensionVisibleContext {
 impl<'a> Dispatcher<'a> {
     /// Create a dispatcher backed by an extension registry.
     #[must_use]
-    pub const fn new(
-        registry: &'a ExtensionRegistry,
-        runtime: &'a mut ExtensionRuntimeHost,
-    ) -> Self {
+    pub const fn new(registry: &'a ExtensionRegistry, runtime: &'a ExtensionRuntimeHost) -> Self {
         Self {
             registry,
             log: None,
@@ -80,7 +77,7 @@ impl<'a> Dispatcher<'a> {
     pub const fn with_log(
         registry: &'a ExtensionRegistry,
         log: &'a EventLog,
-        runtime: &'a mut ExtensionRuntimeHost,
+        runtime: &'a ExtensionRuntimeHost,
     ) -> Self {
         Self {
             registry,
@@ -95,13 +92,13 @@ impl<'a> Dispatcher<'a> {
     ///
     /// Returns an error when installed extension state cannot be read or when a
     /// matched action cannot be executed.
-    pub fn dispatch_event(&mut self, event: &Event) -> Result<Vec<DispatchReport>, SpindleError> {
+    pub fn dispatch_event(&self, event: &Event) -> Result<Vec<DispatchReport>, SpindleError> {
         let surface = InstalledSurface::load(self.registry)?;
         self.dispatch_event_at_depth(&surface, event, 0)
     }
 
     fn dispatch_event_at_depth(
-        &mut self,
+        &self,
         surface: &InstalledSurface,
         event: &Event,
         depth: usize,
@@ -112,7 +109,7 @@ impl<'a> Dispatcher<'a> {
 
         let mut reports = Vec::new();
         for (extension, route) in surface.routes_for_event(event) {
-            surface.ensure_route_capabilities(extension, &route.capabilities)?;
+            surface.ensure_route_capabilities(extension, route)?;
             let args = merge_args(&event.data, &route.args);
             reports.extend(self.dispatch_action_from(
                 &route.action,
@@ -135,7 +132,7 @@ impl<'a> Dispatcher<'a> {
     /// Returns an error when installed extension state cannot be read, no
     /// installed extension exposes the action, or the action process fails.
     pub fn dispatch_action(
-        &mut self,
+        &self,
         action: &str,
         args: &Value,
         capabilities: &[String],
@@ -154,7 +151,7 @@ impl<'a> Dispatcher<'a> {
     }
 
     fn dispatch_action_from(
-        &mut self,
+        &self,
         action: &str,
         args: &Value,
         scope: ActionDispatchScope<'_>,
@@ -185,7 +182,8 @@ impl<'a> Dispatcher<'a> {
         }];
 
         for output_event in output.emitted_events() {
-            let event = action_output_event_to_event(output_event)?;
+            ensure_produced_event(extension, action, &output_event.kind)?;
+            let event = action_output_event_to_event(output_event, &extension.id)?;
             if let Some(log) = self.log {
                 log.append(&event)?;
             }
@@ -220,6 +218,13 @@ impl InstalledSurface {
             .get(&event.kind)
             .into_iter()
             .flatten()
+            .filter(move |handler| {
+                let route = &self.extensions[handler.extension].routes[handler.route];
+                route
+                    .source
+                    .as_ref()
+                    .is_none_or(|source| source == &event.source)
+            })
             .map(|handler| {
                 let extension = &self.extensions[handler.extension];
                 (extension, &extension.routes[handler.route])
@@ -239,10 +244,9 @@ impl InstalledSurface {
     fn ensure_route_capabilities(
         &self,
         extension: &RegisteredExtension,
-        capabilities: &[String],
+        route: &crate::ExtensionRoute,
     ) -> Result<(), SpindleError> {
-        self.policy
-            .ensure_route_capabilities(&extension.id, capabilities)
+        self.policy.ensure_route_capabilities(&extension.id, route)
     }
 
     fn context_for(&self, extension: &RegisteredExtension) -> ExtensionContext {
@@ -287,6 +291,9 @@ impl ExtensionVisibleContext {
 
         for extension in extensions {
             for event in &extension.emits {
+                events.insert((event.clone(), extension.id.clone()));
+            }
+            for event in &extension.produces {
                 events.insert((event.clone(), extension.id.clone()));
             }
             for capability in &extension.capabilities {
@@ -350,8 +357,27 @@ fn ensure_capabilities(
     Ok(())
 }
 
-fn action_output_event_to_event(event: &ActionOutputEvent) -> Result<Event, SpindleError> {
-    Event::builder(event.kind.clone(), event.source.clone())
+fn ensure_produced_event(
+    extension: &RegisteredExtension,
+    action: &str,
+    kind: &str,
+) -> Result<(), SpindleError> {
+    if extension.produces.iter().any(|produced| produced == kind) {
+        return Ok(());
+    }
+
+    Err(SpindleError::UndeclaredProducedEvent {
+        extension: extension.id.clone(),
+        action: String::from(action),
+        kind: String::from(kind),
+    })
+}
+
+fn action_output_event_to_event(
+    event: &ActionOutputEvent,
+    extension_id: &str,
+) -> Result<Event, SpindleError> {
+    Event::builder(event.kind.clone(), String::from(extension_id))
         .subject(event.subject.clone())
         .data(event.data.clone())
         .build()
@@ -396,8 +422,8 @@ mod tests {
         let dir = crate::store::tests_support::test_dir()?;
         fs::create_dir_all(&dir)?;
         let registry = ExtensionRegistry::in_dir(&dir);
-        let mut runtime = ExtensionRuntimeHost::new();
-        let mut dispatcher = Dispatcher::new(&registry, &mut runtime);
+        let runtime = ExtensionRuntimeHost::new();
+        let dispatcher = Dispatcher::new(&registry, &runtime);
 
         let result = dispatcher.dispatch_action("missing.action", &json!({}), &[]);
 
@@ -417,13 +443,13 @@ mod tests {
     #[test]
     fn action_output_becomes_events() -> Result<(), SpindleError> {
         let output = ActionOutput::event(
-            ActionOutputEvent::new("aerospace.workspace.snapshot", "aerospace")
+            ActionOutputEvent::new("aerospace.workspace.snapshot")
                 .with_data(json!({ "active": "2", "occupied": ["1", "2"] })),
         );
         let events = output
             .emitted_events()
             .iter()
-            .map(action_output_event_to_event)
+            .map(|event| action_output_event_to_event(event, "aerospace"))
             .collect::<Result<Vec<_>, _>>()?;
 
         assert_eq!(events.len(), 1);
@@ -442,7 +468,7 @@ mod tests {
         let policy_path = dir.join("capabilities.json");
         crate::store::tests_support::write_capability_policy(
             &dir,
-            r#"{"direct":{},"routes":{"test-recipe":["test.write"]}}"#,
+            r#"{"emits":{"unit":["test.initial"]},"direct":{},"routes":{"test-recipe":[{"source":"unit","event":"test.initial","capabilities":["test.write"]},{"source":"test-host","event":"test.followup","capabilities":["test.write"]}]}}"#,
         )?;
         let host = dir.join("snapshot-host.sh");
         crate::store::tests_support::write_executable(
@@ -453,7 +479,7 @@ policy_path='{}'
 while IFS= read -r line; do
   case "$line" in
     *'"type":"register"'*)
-      printf '%s\n' '{{"type":"registration","registration":{{"capabilities":["test.write"],"actions":{{"test.start":{{"capabilities":["test.write"]}},"test.finish":{{"capabilities":["test.write"]}}}}}}}}'
+      printf '%s\n' '{{"type":"registration","registration":{{"produces":["test.followup"],"capabilities":["test.write"],"actions":{{"test.start":{{"capabilities":["test.write"]}},"test.finish":{{"capabilities":["test.write"]}}}}}}}}'
       ;;
     *'"action":"test.start"'*)
       rm -f "$policy_path"
@@ -492,11 +518,13 @@ done
               "routes": [
                 {
                   "event": "test.initial",
+                  "source": "unit",
                   "action": "test.start",
                   "capabilities": ["test.write"]
                 },
                 {
                   "event": "test.followup",
+                  "source": "test-host",
                   "action": "test.finish",
                   "capabilities": ["test.write"]
                 }
@@ -504,13 +532,13 @@ done
             }"#,
         )?;
         let registry = ExtensionRegistry::in_dir(&dir);
-        registry.install_manifest(&host_manifest)?;
+        let runtime = ExtensionRuntimeHost::new();
+        registry.install_manifest_with_runtime(&host_manifest, &runtime)?;
         registry.install_manifest(&recipe_manifest)?;
         let event = Event::builder(String::from("test.initial"), String::from("unit"))
             .data(json!({}))
             .build()?;
-        let mut runtime = ExtensionRuntimeHost::new();
-        let mut dispatcher = Dispatcher::new(&registry, &mut runtime);
+        let dispatcher = Dispatcher::new(&registry, &runtime);
 
         let reports = dispatcher.dispatch_event(&event)?;
 
@@ -542,6 +570,7 @@ done
             entrypoint: Some(String::from("provider")),
             capabilities: vec![String::from("aerospace.state.read")],
             emits: vec![String::from("aerospace.workspace.changed")],
+            produces: vec![String::from("aerospace.workspace.snapshot")],
             actions: [(
                 String::from("aerospace.workspace.snapshot"),
                 crate::ExtensionAction {
@@ -550,6 +579,7 @@ done
             )]
             .into(),
             routes: Vec::new(),
+            runtime_trust: None,
         };
         let workflow = RegisteredExtension {
             id: String::from("workspace-indicator"),
@@ -558,14 +588,19 @@ done
             runtime: ExtensionRuntime::StdioJsonl,
             entrypoint: Some(String::from("workflow")),
             capabilities: Vec::new(),
-            emits: vec![String::from("sketchybar.message.requested")],
+            emits: Vec::new(),
+            produces: vec![String::from(
+                "workspace-indicator.sketchybar.message.requested",
+            )],
             actions: std::collections::BTreeMap::new(),
             routes: vec![crate::ExtensionRoute {
-                event: String::from("aerospace.workspace.snapshot"),
+                event: String::from("aerospace.route.only"),
+                source: Some(String::from("aerospace")),
                 action: String::from("workspace-indicator.workspaces.render"),
                 capabilities: Vec::new(),
                 args: json!({}),
             }],
+            runtime_trust: None,
         };
 
         let visible_context =
@@ -580,10 +615,16 @@ done
                 .any(|event| event.kind == "aerospace.workspace.changed")
         );
         assert!(
-            !context
+            context
                 .events
                 .iter()
                 .any(|event| event.kind == "aerospace.workspace.snapshot")
+        );
+        assert!(
+            !context
+                .events
+                .iter()
+                .any(|event| event.kind == "aerospace.route.only")
         );
         assert!(
             context

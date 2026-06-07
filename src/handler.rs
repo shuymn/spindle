@@ -15,9 +15,9 @@ pub fn execute_request(
     request: HubRequest,
     log: &EventLog,
     registry: &ExtensionRegistry,
-    runtime: &mut ExtensionRuntimeHost,
+    runtime: &ExtensionRuntimeHost,
 ) -> Result<Value, SpindleError> {
-    let mut state = HandlerState {
+    let state = HandlerState {
         log,
         registry,
         runtime,
@@ -28,7 +28,7 @@ pub fn execute_request(
             source,
             subject,
             data,
-        } => emit_event(kind, source, subject, data, &mut state),
+        } => emit_event(kind, source, subject, data, &state),
         HubRequest::QueryEvents {
             kind,
             source,
@@ -39,13 +39,20 @@ pub fn execute_request(
             source,
             capabilities,
             args,
-        } => invoke_action(&action, source, capabilities, &args, &mut state),
+        } => invoke_action(&action, source, capabilities, &args, &state),
         HubRequest::ValidateExtension { manifest } => {
             let manifest = ExtensionManifest::from_path(&manifest)?;
             Ok(serde_json::to_value(manifest)?)
         }
-        HubRequest::RegisterExtension { manifest } => {
-            let registered = registry.register_manifest_with_runtime(&manifest, runtime)?;
+        HubRequest::RegisterExtension {
+            manifest,
+            trust_runtime,
+        } => {
+            let registered = if trust_runtime {
+                registry.register_manifest_trusting_runtime(&manifest, runtime)?
+            } else {
+                registry.register_manifest(&manifest)?
+            };
             Ok(serde_json::to_value(registered)?)
         }
         HubRequest::ListExtensions => Ok(serde_json::to_value(registry.list()?)?),
@@ -55,7 +62,7 @@ pub fn execute_request(
 struct HandlerState<'a> {
     log: &'a EventLog,
     registry: &'a ExtensionRegistry,
-    runtime: &'a mut ExtensionRuntimeHost,
+    runtime: &'a ExtensionRuntimeHost,
 }
 
 fn emit_event(
@@ -63,8 +70,10 @@ fn emit_event(
     source: String,
     subject: Option<String>,
     data: Value,
-    state: &mut HandlerState<'_>,
+    state: &HandlerState<'_>,
 ) -> Result<Value, SpindleError> {
+    let policy = CapabilityPolicy::load(state_dir_for_log(state.log))?;
+    policy.ensure_emit(&source, &kind)?;
     let event = Event::builder(kind, source)
         .subject(subject)
         .data(data)
@@ -97,7 +106,7 @@ fn invoke_action(
     source: String,
     capabilities: Vec<String>,
     args: &Value,
-    state: &mut HandlerState<'_>,
+    state: &HandlerState<'_>,
 ) -> Result<Value, SpindleError> {
     let policy = CapabilityPolicy::load(state_dir_for_log(state.log))?;
     policy.ensure_direct_grants(&source, &capabilities)?;
@@ -124,25 +133,31 @@ fn state_dir_for_log(log: &EventLog) -> &std::path::Path {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, fs, os::unix::fs::PermissionsExt};
+    use std::{collections::BTreeMap, fs};
 
     use serde_json::json;
 
     use super::*;
 
-    fn write_executable(path: &std::path::Path, contents: &str) -> Result<(), SpindleError> {
-        fs::write(path, contents)?;
-        let mut permissions = fs::metadata(path)?.permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions)?;
-        Ok(())
-    }
-
     fn write_capability_policy(
         dir: &std::path::Path,
+        emits: &[(&str, &[&str])],
         direct: &[(&str, &[&str])],
-        routes: &[(&str, &[&str])],
+        routes: &[(&str, &str, &str, &[&str])],
     ) -> Result<(), SpindleError> {
+        fs::create_dir_all(dir)?;
+        let emits = emits
+            .iter()
+            .map(|(grantor, events)| {
+                (
+                    String::from(*grantor),
+                    events
+                        .iter()
+                        .map(|event| String::from(*event))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         let direct = direct
             .iter()
             .map(|(grantor, capabilities)| {
@@ -155,23 +170,23 @@ mod tests {
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        let routes = routes
-            .iter()
-            .map(|(grantor, capabilities)| {
-                (
-                    String::from(*grantor),
-                    capabilities
-                        .iter()
-                        .map(|capability| String::from(*capability))
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
+        let mut routes_by_grantor = BTreeMap::<String, Vec<serde_json::Value>>::new();
+        for (grantor, source, event, capabilities) in routes {
+            routes_by_grantor
+                .entry(String::from(*grantor))
+                .or_default()
+                .push(json!({
+                    "source": source,
+                    "event": event,
+                    "capabilities": capabilities
+                }));
+        }
         fs::write(
             dir.join("capabilities.json"),
             serde_json::to_string_pretty(&json!({
+                "emits": emits,
                 "direct": direct,
-                "routes": routes
+                "routes": routes_by_grantor
             }))?,
         )?;
         Ok(())
@@ -182,7 +197,8 @@ mod tests {
         let dir = crate::store::tests_support::test_dir()?;
         let log = EventLog::in_dir(&dir);
         let registry = ExtensionRegistry::in_dir(&dir);
-        let mut runtime = ExtensionRuntimeHost::new();
+        let runtime = ExtensionRuntimeHost::new();
+        write_capability_policy(&dir, &[("codex-hook", &["agent.status.changed"])], &[], &[])?;
 
         let response = execute_request(
             HubRequest::Emit {
@@ -193,7 +209,7 @@ mod tests {
             },
             &log,
             &registry,
-            &mut runtime,
+            &runtime,
         )?;
 
         assert_eq!(response["event"]["type"], "agent.status.changed");
@@ -208,7 +224,7 @@ mod tests {
         let dir = crate::store::tests_support::test_dir()?;
         fs::create_dir_all(&dir)?;
         let host = dir.join("adapter-host.sh");
-        write_executable(
+        crate::store::tests_support::write_executable(
             &host,
             r#"#!/bin/sh
 while IFS= read -r line; do
@@ -247,6 +263,7 @@ done
               "routes": [
                 {
                   "event": "test.changed",
+                  "source": "test",
                   "action": "test.render",
                   "capabilities": ["test.write"]
                 }
@@ -256,10 +273,15 @@ done
 
         let log = EventLog::in_dir(&dir);
         let registry = ExtensionRegistry::in_dir(&dir);
-        write_capability_policy(&dir, &[], &[("test-recipe", &["test.write"])])?;
-        registry.install_manifest(&adapter_manifest)?;
+        let runtime = ExtensionRuntimeHost::new();
+        write_capability_policy(
+            &dir,
+            &[("test", &["test.changed"])],
+            &[],
+            &[("test-recipe", "test", "test.changed", &["test.write"])],
+        )?;
+        registry.install_manifest_with_runtime(&adapter_manifest, &runtime)?;
         registry.install_manifest(&recipe_manifest)?;
-        let mut runtime = ExtensionRuntimeHost::new();
 
         let response = execute_request(
             HubRequest::Emit {
@@ -270,7 +292,7 @@ done
             },
             &log,
             &registry,
-            &mut runtime,
+            &runtime,
         )?;
 
         assert_eq!(response["dispatches"][0]["action"], "test.render");
@@ -284,7 +306,7 @@ done
         let dir = crate::store::tests_support::test_dir()?;
         fs::create_dir_all(&dir)?;
         let host = dir.join("policy-host.sh");
-        write_executable(
+        crate::store::tests_support::write_executable(
             &host,
             r#"#!/bin/sh
 while IFS= read -r line; do
@@ -315,8 +337,8 @@ done
         )?;
         let log = EventLog::in_dir(&dir);
         let registry = ExtensionRegistry::in_dir(&dir);
-        registry.install_manifest(&manifest)?;
-        let mut runtime = ExtensionRuntimeHost::new();
+        let runtime = ExtensionRuntimeHost::new();
+        registry.install_manifest_with_runtime(&manifest, &runtime)?;
 
         let denied = execute_request(
             HubRequest::Invoke {
@@ -327,7 +349,7 @@ done
             },
             &log,
             &registry,
-            &mut runtime,
+            &runtime,
         );
 
         assert!(matches!(
@@ -335,7 +357,7 @@ done
             Err(SpindleError::CapabilityGrantDenied { .. })
         ));
 
-        write_capability_policy(&dir, &[("unit", &["test.write"])], &[])?;
+        write_capability_policy(&dir, &[], &[("unit", &["test.write"])], &[])?;
         let response = execute_request(
             HubRequest::Invoke {
                 action: String::from("test.render"),
@@ -345,7 +367,7 @@ done
             },
             &log,
             &registry,
-            &mut runtime,
+            &runtime,
         )?;
 
         assert_eq!(response["dispatches"][0]["action"], "test.render");

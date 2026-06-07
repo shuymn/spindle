@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::{
     EventFilter, EventLog, ExtensionManifest, ExtensionRegistry, ExtensionRuntimeHost, HubRequest,
-    SpindleError, execute_request, send_request, serve,
+    SpindleError, execute_request, send_request, serve, validate_json_object,
 };
 
 /// Run the spindle command-line interface.
@@ -75,6 +75,8 @@ struct SendArgs {
 
 #[derive(Debug, Args)]
 struct InstallArgs {
+    #[arg(long)]
+    trust_runtime: bool,
     #[arg(value_name = "EXTENSION")]
     extension: PathBuf,
 }
@@ -135,6 +137,8 @@ struct ExtensionCommand {
 enum ExtensionSubcommand {
     /// Validate a JSON extension manifest.
     Validate(ValidateExtensionArgs),
+    /// Show runtime-discovered extension surface without registering it.
+    Surface(SurfaceExtensionArgs),
     /// Register or replace an extension manifest.
     Register(RegisterExtensionArgs),
     /// List registered extensions.
@@ -149,6 +153,16 @@ struct ValidateExtensionArgs {
 
 #[derive(Debug, Args)]
 struct RegisterExtensionArgs {
+    #[arg(long)]
+    trust_runtime: bool,
+    #[arg(value_name = "MANIFEST")]
+    manifest: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct SurfaceExtensionArgs {
+    #[arg(long)]
+    trust_runtime: bool,
     #[arg(value_name = "MANIFEST")]
     manifest: PathBuf,
 }
@@ -157,7 +171,7 @@ fn run_cli(cli: Cli) -> Result<()> {
     let state_dir = resolve_state_dir(cli.state_dir)?;
     let log = EventLog::in_dir(&state_dir);
     let registry = ExtensionRegistry::in_dir(&state_dir);
-    let mut runtime = ExtensionRuntimeHost::new();
+    let runtime = ExtensionRuntimeHost::new();
 
     match cli.command {
         Command::Daemon(args) | Command::Serve(args) => {
@@ -166,7 +180,11 @@ fn run_cli(cli: Cli) -> Result<()> {
         }
         Command::Install(args) => {
             let manifest = resolve_install_manifest(&args.extension);
-            let registered = registry.install_manifest_with_runtime(&manifest, &mut runtime)?;
+            let registered = if args.trust_runtime {
+                registry.install_manifest_with_runtime(&manifest, &runtime)?
+            } else {
+                registry.install_manifest(&manifest)?
+            };
             write_json(&registered)?;
         }
         Command::Send(args) => {
@@ -177,7 +195,8 @@ fn run_cli(cli: Cli) -> Result<()> {
             write_json(&response)?;
         }
         Command::Emit(args) => {
-            let data = parse_json(&args.data).context("failed to parse --data as JSON")?;
+            let data = parse_json_object("data", &args.data)
+                .context("failed to parse --data as JSON object")?;
             let response = execute_request(
                 HubRequest::Emit {
                     kind: args.kind,
@@ -187,7 +206,7 @@ fn run_cli(cli: Cli) -> Result<()> {
                 },
                 &log,
                 &registry,
-                &mut runtime,
+                &runtime,
             )?;
             write_json(&response)?;
         }
@@ -202,7 +221,8 @@ fn run_cli(cli: Cli) -> Result<()> {
             write_json(&events)?;
         }
         Command::Invoke(args) => {
-            let action_args = parse_json(&args.args).context("failed to parse --args as JSON")?;
+            let action_args = parse_json_object("args", &args.args)
+                .context("failed to parse --args as JSON object")?;
             let response = execute_request(
                 HubRequest::Invoke {
                     action: args.action,
@@ -212,7 +232,7 @@ fn run_cli(cli: Cli) -> Result<()> {
                 },
                 &log,
                 &registry,
-                &mut runtime,
+                &runtime,
             )?;
             write_json(&response)?;
         }
@@ -223,10 +243,26 @@ fn run_cli(cli: Cli) -> Result<()> {
             write_json(&manifest)?;
         }
         Command::Extension(ExtensionCommand {
+            command: ExtensionSubcommand::Surface(args),
+        }) => {
+            if !args.trust_runtime {
+                return Err(SpindleError::RuntimeTrustRequired {
+                    extension: args.manifest.display().to_string(),
+                }
+                .into());
+            }
+            let manifest =
+                ExtensionManifest::from_path_with_registration(&args.manifest, &runtime)?;
+            write_json(&manifest)?;
+        }
+        Command::Extension(ExtensionCommand {
             command: ExtensionSubcommand::Register(args),
         }) => {
-            let registered =
-                registry.register_manifest_with_runtime(&args.manifest, &mut runtime)?;
+            let registered = if args.trust_runtime {
+                registry.register_manifest_trusting_runtime(&args.manifest, &runtime)?
+            } else {
+                registry.register_manifest(&args.manifest)?
+            };
             write_json(&registered)?;
         }
         Command::Extension(ExtensionCommand {
@@ -240,8 +276,10 @@ fn run_cli(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-fn parse_json(input: &str) -> Result<Value> {
-    Ok(serde_json::from_str(input)?)
+fn parse_json_object(field: &'static str, input: &str) -> Result<Value> {
+    let value = serde_json::from_str(input)?;
+    validate_json_object(field, &value)?;
+    Ok(value)
 }
 
 fn write_json<T>(value: &T) -> Result<()>
@@ -290,6 +328,8 @@ fn resolve_install_manifest(extension: &std::path::Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     #[test]
@@ -300,9 +340,98 @@ mod tests {
     }
 
     #[test]
-    fn parse_json_accepts_objects() -> Result<()> {
-        let value = parse_json(r#"{"state":"testing"}"#)?;
+    fn parse_json_object_accepts_objects() -> Result<()> {
+        let value = parse_json_object("data", r#"{"state":"testing"}"#)?;
         assert_eq!(value["state"], "testing");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_json_object_rejects_arrays() {
+        let result = parse_json_object("data", r#"["testing"]"#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn surface_trust_runtime_does_not_write_registry() -> Result<()> {
+        let dir = crate::store::tests_support::test_dir()?;
+        fs::create_dir_all(&dir)?;
+        let host = dir.join("host.sh");
+        crate::store::tests_support::write_executable(
+            &host,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"type":"register"'*)
+      printf '%s\n' '{"type":"registration","registration":{"produces":["test.rendered"],"actions":{"test.render":{"capabilities":[]}}}}'
+      ;;
+    *'"type":"shutdown"'*)
+      printf '%s\n' '{"type":"shutdown"}'
+      exit 0
+      ;;
+  esac
+done
+"#,
+        )?;
+        let manifest = dir.join("extension.json");
+        fs::write(
+            &manifest,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "id": "surface-only",
+                "version": "0.1.0",
+                "runtime": "stdio-jsonl",
+                "entrypoint": host,
+                "capabilities": [],
+                "actions": {}
+            }))?,
+        )?;
+
+        run_cli(Cli {
+            state_dir: Some(dir.clone()),
+            command: Command::Extension(ExtensionCommand {
+                command: ExtensionSubcommand::Surface(SurfaceExtensionArgs {
+                    trust_runtime: true,
+                    manifest,
+                }),
+            }),
+        })?;
+
+        assert!(!dir.join("extensions.json").exists());
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn emit_rejects_non_object_data_from_cli() -> Result<()> {
+        let dir = crate::store::tests_support::test_dir()?;
+        let result = run_cli(Cli {
+            state_dir: Some(dir),
+            command: Command::Emit(EmitArgs {
+                kind: String::from("test.changed"),
+                source: String::from("test"),
+                subject: None,
+                data: String::from("[]"),
+            }),
+        });
+
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn invoke_rejects_non_object_args_from_cli() -> Result<()> {
+        let dir = crate::store::tests_support::test_dir()?;
+        let result = run_cli(Cli {
+            state_dir: Some(dir),
+            command: Command::Invoke(InvokeArgs {
+                action: String::from("test.render"),
+                source: String::from("test"),
+                capabilities: Vec::new(),
+                args: String::from("[]"),
+            }),
+        });
+
+        assert!(result.is_err());
         Ok(())
     }
 
