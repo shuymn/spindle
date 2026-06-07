@@ -11,7 +11,7 @@ on:
 jobs:
   lint:
     name: Lint
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     timeout-minutes: 10
     permissions:
       contents: read
@@ -42,7 +42,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
 
     steps:
       - name: Checkout code
@@ -64,8 +64,8 @@ jobs:
   build:
     name: Build
     needs: test
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
+    runs-on: macos-latest
+    timeout-minutes: 10
     permissions:
       contents: read
 
@@ -85,27 +85,3 @@ jobs:
 
       - name: Build workspace
         run: task build
-
-  macos:
-    name: macOS Check
-    runs-on: macos-latest
-    timeout-minutes: 15
-    permissions:
-      contents: read
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-
-      - name: Set up Rust
-        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16
-        with:
-          cache: true
-
-      - name: Set up Task
-        uses: shuymn/github-actions/.github/actions/setup-task@a8738b31f97fc93c8d7254ea6a9524152997bf68
-
-      - name: Check macOS compatibility
-        run: cargo check --workspace --locked
