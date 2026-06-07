@@ -38,8 +38,8 @@ fn manifest_rejects_duplicate_action_capabilities() {
     let manifest = ExtensionManifest {
         id: String::from("duplicate-action-capability"),
         version: String::from("0.1.0"),
-        entrypoint: None,
-        runtime: ExtensionRuntime::Recipe,
+        entrypoint: Some(String::from("./bin/extension")),
+        runtime: ExtensionRuntime::StdioJsonl,
         emits: Vec::new(),
         produces: Vec::new(),
         capabilities: vec![String::from("test.write")],
@@ -52,6 +52,36 @@ fn manifest_rejects_duplicate_action_capabilities() {
         Err(SpindleError::InvalidField {
             field: "action.capabilities",
             ..
+        })
+    ));
+}
+
+#[test]
+fn manifest_rejects_recipe_actions() {
+    let mut actions = BTreeMap::new();
+    actions.insert(
+        String::from("workflow.render"),
+        ExtensionAction {
+            capabilities: Vec::new(),
+        },
+    );
+    let manifest = ExtensionManifest {
+        id: String::from("recipe-with-actions"),
+        version: String::from("0.1.0"),
+        entrypoint: None,
+        runtime: ExtensionRuntime::Recipe,
+        emits: Vec::new(),
+        produces: Vec::new(),
+        capabilities: Vec::new(),
+        actions,
+        routes: Vec::new(),
+    };
+
+    assert!(matches!(
+        manifest.validate(),
+        Err(SpindleError::InvalidField {
+            field: "actions",
+            reason: "recipe extensions cannot declare actions",
         })
     ));
 }

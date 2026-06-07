@@ -65,11 +65,19 @@ fn write_static_manifest_with_surface(
             )
         })
         .collect::<BTreeMap<_, _>>();
+    let (runtime, entrypoint) = if surface.action_names.is_empty() {
+        (ExtensionRuntime::Recipe, None)
+    } else {
+        (
+            ExtensionRuntime::StdioJsonl,
+            Some(String::from("./bin/extension")),
+        )
+    };
     let manifest = ExtensionManifest {
         id: String::from(id),
         version: String::from("0.1.0"),
-        entrypoint: None,
-        runtime: ExtensionRuntime::Recipe,
+        entrypoint,
+        runtime,
         emits: surface
             .emits
             .iter()

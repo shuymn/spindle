@@ -72,26 +72,35 @@ fn registry_registers_manifest() -> Result<(), SpindleError> {
     let dir = crate::store::tests_support::test_dir()?;
     fs::create_dir_all(&dir)?;
     let manifest_path = dir.join("extension.json");
+    let provider_host = dir.join("provider-host.sh");
+    crate::store::tests_support::write_executable(&provider_host, "#!/bin/sh\nexit 0\n")?;
     fs::write(
         &manifest_path,
-        r#"{
+        format!(
+            r#"{{
               "id": "sketchybar-agent-status",
               "version": "0.1.0",
-              "runtime": "recipe",
+              "entrypoint": "{}",
+              "runtime": "stdio-jsonl",
               "capabilities": ["sketchybar.ui.write"],
-              "actions": {
-                "sketchybar.agentStatus.render": {
+              "actions": {{
+                "sketchybar.agentStatus.render": {{
                   "capabilities": ["sketchybar.ui.write"]
-                }
-              }
-            }"#,
+                }}
+              }}
+            }}"#,
+            provider_host.display()
+        ),
     )?;
 
     let registry = ExtensionRegistry::in_dir(&dir);
     let registered = registry.register_manifest(&manifest_path)?;
 
     assert_eq!(registered.id, "sketchybar-agent-status");
-    assert_eq!(registered.entrypoint, None);
+    assert_eq!(
+        registered.entrypoint,
+        Some(provider_host.to_string_lossy().into_owned())
+    );
     assert_eq!(registry.list()?, vec![registered]);
     assert_eq!(
         fs::metadata(dir.join("extensions.json"))?

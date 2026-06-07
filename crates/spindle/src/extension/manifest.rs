@@ -193,11 +193,20 @@ impl ExtensionManifest {
 
     fn validate_runtime_fields(&self) -> Result<(), SpindleError> {
         match self.runtime {
-            ExtensionRuntime::Recipe => validate_optional_entrypoint(self.entrypoint.as_deref()),
+            ExtensionRuntime::Recipe => {
+                validate_optional_entrypoint(self.entrypoint.as_deref())?;
+                if !self.actions.is_empty() {
+                    return Err(SpindleError::InvalidField {
+                        field: "actions",
+                        reason: "recipe extensions cannot declare actions",
+                    });
+                }
+            }
             ExtensionRuntime::StdioJsonl => {
-                validate_required_entrypoint(self.entrypoint.as_deref())
+                validate_required_entrypoint(self.entrypoint.as_deref())?;
             }
         }
+        Ok(())
     }
 
     pub(crate) fn apply_runtime_registration(
