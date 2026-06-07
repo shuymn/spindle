@@ -17,7 +17,6 @@ use spindle_extension_sdk::{
 };
 
 const DEFAULT_SETTLE_MS: u64 = 50;
-const SOURCE: &str = "aerospace";
 const EVENT_WORKSPACE_CHANGED: &str = "aerospace.workspace.changed";
 const EVENT_FOCUS_CHANGED: &str = "aerospace.focus.changed";
 const EVENT_MONITOR_CHANGED: &str = "aerospace.monitor.changed";
@@ -168,7 +167,7 @@ fn workspace_snapshot_action(context: &ActionContext) -> Result<ActionOutput> {
     );
     let snapshot = read_workspace_snapshot(action_args.focused_workspace.as_deref())?;
     Ok(ActionOutput::event(
-        ActionOutputEvent::new(ACTION_WORKSPACE_SNAPSHOT, SOURCE)
+        ActionOutputEvent::new(ACTION_WORKSPACE_SNAPSHOT)
             .with_data(serde_json::to_value(snapshot)?),
     ))
 }
@@ -176,14 +175,14 @@ fn workspace_snapshot_action(context: &ActionContext) -> Result<ActionOutput> {
 fn mode_snapshot_action() -> Result<ActionOutput> {
     let mode = read_mode()?;
     Ok(ActionOutput::event(
-        ActionOutputEvent::new(ACTION_MODE_SNAPSHOT, SOURCE).with_data(json!({ "mode": mode })),
+        ActionOutputEvent::new(ACTION_MODE_SNAPSHOT).with_data(json!({ "mode": mode })),
     ))
 }
 
 fn layout_snapshot_action() -> Result<ActionOutput> {
     let window_info = read_layout()?;
     Ok(ActionOutput::event(
-        ActionOutputEvent::new(ACTION_LAYOUT_SNAPSHOT, SOURCE)
+        ActionOutputEvent::new(ACTION_LAYOUT_SNAPSHOT)
             .with_data(json!({ "window_info": window_info })),
     ))
 }
@@ -215,6 +214,9 @@ fn registration() -> ExtensionRegistration {
         .emit(EVENT_MONITOR_CHANGED)
         .emit(EVENT_MODE_CHANGED)
         .emit(EVENT_LAYOUT_CHANGED)
+        .produce(ACTION_WORKSPACE_SNAPSHOT)
+        .produce(ACTION_MODE_SNAPSHOT)
+        .produce(ACTION_LAYOUT_SNAPSHOT)
         .capability(CAPABILITY_STATE_READ)
         .capability(CAPABILITY_WINDOW_CONTROL)
         .action(

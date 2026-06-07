@@ -64,6 +64,51 @@ fn cli_focus_workspace_uses_aerospace_socket() -> anyhow::Result<()> {
 }
 
 #[test]
+fn cli_uses_focused_workspace_env_fallback() -> anyhow::Result<()> {
+    let (_dir, socket_path) = test_socket_path()?;
+    let listener = UnixListener::bind(&socket_path)?;
+    let handle = thread::spawn(move || -> anyhow::Result<String> {
+        let (mut stream, _address) = listener.accept()?;
+        let mut buffer = [0_u8; 4096];
+        let read = stream.read(&mut buffer)?;
+        let request = String::from_utf8(buffer[..read].to_vec())?;
+        stream.write_all(
+            serde_json::to_string(&json!({
+                "serverVersionAndHash": "0.20.0-Beta abc",
+                "stdout": "",
+                "stderr": "",
+                "exitCode": 0
+            }))?
+            .as_bytes(),
+        )?;
+        Ok(request)
+    });
+
+    let focus = Command::new(env!("CARGO_BIN_EXE_spindle-aerospace"))
+        .arg("focus-workspace")
+        .arg("2")
+        .env("AEROSPACESOCK", &socket_path)
+        .env_remove("AEROSPACE_WORKSPACE")
+        .env("AEROSPACE_FOCUSED_WORKSPACE", "dev")
+        .output()?;
+
+    assert!(
+        focus.status.success(),
+        "focus-workspace failed: {}",
+        String::from_utf8_lossy(&focus.stderr)
+    );
+    let request = handle
+        .join()
+        .map_err(|_payload| anyhow::anyhow!("server thread panicked"))??;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&request)?["workspace"],
+        "dev"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn cli_register_ignores_unrelated_spindle_env() -> anyhow::Result<()> {
     let output = Command::new(env!("CARGO_BIN_EXE_spindle-aerospace"))
         .arg("register")

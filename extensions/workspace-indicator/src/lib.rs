@@ -29,10 +29,7 @@ const LAYOUT_ACCORDION_COLOR: &str = "0xff58a6ff";
 const LAYOUT_TILED_COLOR: &str = "0xff3fb950";
 
 /// Event emitted when a generic `SketchyBar` message should be sent.
-pub const OUTPUT_EVENT: &str = "sketchybar.message.requested";
-/// Source used for workspace-indicator output events.
-pub const OUTPUT_SOURCE: &str = "workspace-indicator";
-
+pub const OUTPUT_EVENT: &str = "workspace-indicator.sketchybar.message.requested";
 /// Error returned by the workspace indicator extension.
 #[derive(Debug, Error)]
 pub enum WorkspaceIndicatorError {
@@ -93,7 +90,7 @@ impl SketchybarMessageRequest {
     /// Convert this message request into a spindle event.
     #[must_use]
     pub fn into_event(self) -> ActionOutputEvent {
-        ActionOutputEvent::new(OUTPUT_EVENT, OUTPUT_SOURCE).with_data(json!({
+        ActionOutputEvent::new(OUTPUT_EVENT).with_data(json!({
             "args": self.args,
             "cache_key": self.cache_key,
             "cache_value": self.cache_value,
@@ -144,7 +141,7 @@ pub fn build_mode_status(item: &str, mode: &str) -> SketchybarMessageRequest {
 
     status_update(
         item,
-        &[
+        vec![
             property("label", label),
             property("label.color", label_color),
             property("background.color", background_color),
@@ -159,7 +156,7 @@ pub fn build_layout_status(item: &str, window_info: Option<&str>) -> SketchybarM
     let (label, color) = layout_status(window_info);
     status_update(
         item,
-        &[property("label", label), property("label.color", color)],
+        vec![property("label", label), property("label.color", color)],
         &[label, color],
     )
 }
@@ -300,13 +297,13 @@ fn property(key: &str, value: &str) -> String {
 
 fn status_update(
     item: &str,
-    properties: &[String],
+    properties: Vec<String>,
     cache_parts: &[&str],
 ) -> SketchybarMessageRequest {
     let mut args = Vec::with_capacity(properties.len() + 2);
     args.push(String::from("--set"));
     args.push(String::from(item));
-    args.extend_from_slice(properties);
+    args.extend(properties);
 
     SketchybarMessageRequest {
         args,
@@ -328,7 +325,7 @@ fn build_unknown_mode_status(item: &str, mode: &str) -> SketchybarMessageRequest
         .map_or_else(|| String::from("?"), uppercase_char);
     status_update(
         item,
-        &[
+        vec![
             property("label", &label),
             property("label.color", ACTIVE_LABEL_COLOR),
             property("background.color", ACTIVE_BACKGROUND_COLOR),

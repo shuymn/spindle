@@ -47,11 +47,14 @@ int32_t spindle_sketchybar_send(const char *bar_name,
   msg.descriptor.deallocate = false;
   msg.descriptor.type = MACH_MSG_OOL_DESCRIPTOR;
 
-  return mach_msg(&msg.header,
-                  MACH_SEND_MSG,
-                  sizeof(struct spindle_mach_message),
-                  0,
-                  MACH_PORT_NULL,
-                  MACH_MSG_TIMEOUT_NONE,
-                  MACH_PORT_NULL);
+  kern_return_t send = mach_msg(&msg.header,
+                                MACH_SEND_MSG,
+                                sizeof(struct spindle_mach_message),
+                                0,
+                                MACH_PORT_NULL,
+                                MACH_MSG_TIMEOUT_NONE,
+                                MACH_PORT_NULL);
+  // bootstrap_look_up returns a send right owned by this process.
+  mach_port_deallocate(mach_task_self(), port);
+  return send;
 }

@@ -64,8 +64,10 @@ fn message_request_becomes_generic_sketchybar_event() -> anyhow::Result<()> {
 
     let event = build_workspace_message(&workspaces, &snapshot)?.into_event();
 
-    assert_eq!(event.kind, "sketchybar.message.requested");
-    assert_eq!(event.source, "workspace-indicator");
+    assert_eq!(
+        event.kind,
+        "workspace-indicator.sketchybar.message.requested"
+    );
     assert_eq!(
         event.data,
         json!({

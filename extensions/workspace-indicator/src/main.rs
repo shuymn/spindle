@@ -262,24 +262,26 @@ fn ensure_output_surface(extension: Option<&ExtensionContext>) -> Result<()> {
 
 fn registration() -> ExtensionRegistration {
     ExtensionRegistration::new()
-        .emit(OUTPUT_EVENT)
+        .produce(OUTPUT_EVENT)
         .route(workspace_snapshot_route(AEROSPACE_WORKSPACE_CHANGED_EVENT))
         .route(workspace_snapshot_route(AEROSPACE_MONITOR_CHANGED_EVENT))
-        .on(
+        .on_from(
+            "aerospace",
             AEROSPACE_WORKSPACE_SNAPSHOT_ACTION,
             ACTION_RENDER_WORKSPACES,
             RegistrationAction::new(),
         )
         .route(
             RegistrationRoute::new(OUTPUT_EVENT, OUTPUT_ACTION)
+                .source("workspace-indicator")
                 .capability(SKETCHYBAR_UI_WRITE_CAPABILITY),
         )
         .route(state_route(
             AEROSPACE_MODE_CHANGED_EVENT,
             AEROSPACE_MODE_SNAPSHOT_ACTION,
         ))
-        .on_with_args(
-            AEROSPACE_MODE_SNAPSHOT_ACTION,
+        .on_with_args_from(
+            ("aerospace", AEROSPACE_MODE_SNAPSHOT_ACTION),
             ACTION_RENDER_STATUS,
             RegistrationAction::new(),
             json!({ "item": MODE_ITEM }),
@@ -292,8 +294,8 @@ fn registration() -> ExtensionRegistration {
             AEROSPACE_LAYOUT_CHANGED_EVENT,
             AEROSPACE_LAYOUT_SNAPSHOT_ACTION,
         ))
-        .on_with_args(
-            AEROSPACE_LAYOUT_SNAPSHOT_ACTION,
+        .on_with_args_from(
+            ("aerospace", AEROSPACE_LAYOUT_SNAPSHOT_ACTION),
             ACTION_RENDER_STATUS,
             RegistrationAction::new(),
             json!({ "item": LAYOUT_ITEM }),
@@ -303,12 +305,15 @@ fn registration() -> ExtensionRegistration {
                 SKETCHYBAR_WORKSPACE_CLICKED_EVENT,
                 AEROSPACE_WORKSPACE_FOCUS_ACTION,
             )
+            .source("sketchybar")
             .capability(AEROSPACE_WINDOW_CONTROL_CAPABILITY),
         )
 }
 
 fn state_route(event: &str, action: &str) -> RegistrationRoute {
-    RegistrationRoute::new(event, action).capability(AEROSPACE_STATE_READ_CAPABILITY)
+    RegistrationRoute::new(event, action)
+        .source("aerospace")
+        .capability(AEROSPACE_STATE_READ_CAPABILITY)
 }
 
 fn workspace_snapshot_route(event: &str) -> RegistrationRoute {

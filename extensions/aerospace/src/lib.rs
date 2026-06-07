@@ -20,6 +20,7 @@ use thiserror::Error;
 const AEROSPACE_SOCKET_ENV: &str = "AEROSPACESOCK";
 const AEROSPACE_WINDOW_ID_ENV: &str = "AEROSPACE_WINDOW_ID";
 const AEROSPACE_WORKSPACE_ENV: &str = "AEROSPACE_WORKSPACE";
+const AEROSPACE_FOCUSED_WORKSPACE_ENV: &str = "AEROSPACE_FOCUSED_WORKSPACE";
 
 /// Error returned by the `AeroSpace` extension.
 #[derive(Debug, Error)]
@@ -301,10 +302,10 @@ pub fn read_mode_with_client<A>(aerospace: &A) -> Result<Option<String>, Aerospa
 where
     A: AerospaceClient,
 {
-    Ok(stdout_optional(aerospace, "list-modes", &["--current"])?
-        .as_deref()
-        .and_then(first_non_empty_line)
-        .map(String::from))
+    Ok(
+        first_non_empty_line(&stdout_required(aerospace, "list-modes", &["--current"])?)
+            .map(String::from),
+    )
 }
 
 /// Read focused window layout info for status rendering.
@@ -326,7 +327,7 @@ pub fn read_layout_with_client<A>(aerospace: &A) -> Result<Option<String>, Aeros
 where
     A: AerospaceClient,
 {
-    Ok(stdout_optional(
+    Ok(first_non_empty_line(&stdout_required(
         aerospace,
         "list-windows",
         &[
@@ -334,9 +335,7 @@ where
             "--format",
             "%{window-is-fullscreen}|%{window-layout}",
         ],
-    )?
-    .as_deref()
-    .and_then(first_non_empty_line)
+    )?)
     .map(String::from))
 }
 
@@ -346,15 +345,15 @@ where
 ///
 /// Returns an error when the IPC transport fails or `AeroSpace` rejects the
 /// command.
-pub fn stdout_optional<A>(
+pub fn stdout_required<A>(
     aerospace: &A,
     command: &str,
     args: &[&str],
-) -> Result<Option<String>, AerospaceError>
+) -> Result<String, AerospaceError>
 where
     A: AerospaceClient,
 {
-    Ok(Some(aerospace.send_command(command, args)?.stdout))
+    Ok(aerospace.send_command(command, args)?.stdout)
 }
 
 impl<T> From<PoisonError<T>> for AerospaceError {
@@ -381,7 +380,9 @@ impl AerospaceRequest {
         let window_id = env::var(AEROSPACE_WINDOW_ID_ENV)
             .ok()
             .and_then(|value| value.parse::<u64>().ok());
-        let workspace = env::var(AEROSPACE_WORKSPACE_ENV).ok();
+        let workspace = env::var(AEROSPACE_WORKSPACE_ENV)
+            .or_else(|_error| env::var(AEROSPACE_FOCUSED_WORKSPACE_ENV))
+            .ok();
         Self {
             command: "",
             args: full_args,
@@ -445,9 +446,7 @@ fn read_focused_workspace<A>(aerospace: &A) -> Result<Option<String>, AerospaceE
 where
     A: AerospaceClient,
 {
-    let Some(output) = stdout_optional(aerospace, "list-workspaces", &["--focused"])? else {
-        return Ok(None);
-    };
+    let output = stdout_required(aerospace, "list-workspaces", &["--focused"])?;
     Ok(first_non_empty_line(&output).map(String::from))
 }
 
@@ -455,14 +454,11 @@ fn read_occupied_workspaces<A>(aerospace: &A) -> Result<BTreeSet<String>, Aerosp
 where
     A: AerospaceClient,
 {
-    let Some(output) = stdout_optional(
+    let output = stdout_required(
         aerospace,
         "list-windows",
         &["--all", "--format", "%{workspace}"],
-    )?
-    else {
-        return Ok(BTreeSet::new());
-    };
+    )?;
 
     Ok(output
         .lines()
