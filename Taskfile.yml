@@ -35,7 +35,9 @@ tasks:
     desc: Run all tests
     summary: |
       Runs unit, integration, and documentation tests across the workspace.
+      Builds spindle-test-host first because stdio integration tests spawn that binary.
     cmds:
+      - cargo build -p spindle-test-host --locked
       - cargo test --workspace --all-targets --all-features --locked
 
   doc:
