@@ -1,0 +1,23 @@
+[package]
+name = "spindle"
+version = "0.1.0"
+edition = "2024"
+description = "Self-extensible local automation harness for macOS workflows."
+license = "MIT"
+repository = "https://github.com/shuymn/spindle"
+readme = "../../README.md"
+keywords = ["automation", "macos", "agent", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+spindle-extension-sdk = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+
+[lints]
+workspace = true

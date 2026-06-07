@@ -1,53 +1,30 @@
-[package]
-name = "spindle"
-version = "0.1.0"
-edition = "2024"
-description = "Self-extensible local automation harness for macOS workflows."
-license = "MIT"
-repository = "https://github.com/shuymn/spindle"
-keywords = ["automation", "macos", "agent", "cli"]
-categories = ["command-line-utilities", "development-tools"]
-
 [workspace]
 members = [
-    ".",
+    "crates/spindle",
     "crates/spindle-extension-sdk",
-    "extensions/aerospace",
-    "extensions/sketchybar",
-    "extensions/workspace-indicator",
 ]
 resolver = "3"
 
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/shuymn/spindle"
+
 [workspace.dependencies]
 anyhow = "1.0.102"
-cc = "1.2.49"
 clap = { version = "4.6.1", features = ["derive"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sha2 = "0.10.9"
 spindle-extension-sdk = { path = "crates/spindle-extension-sdk" }
-tempfile = "3.23.0"
 thiserror = "2.0.18"
-# `Uuid::now_v7()` needs randomness. The uuid crate currently keeps wasm target
-# support entries in Cargo.lock even for native daemon builds.
 uuid = { version = "1.12.1", default-features = false, features = ["v7", "std", "rng"] }
 
-[dependencies]
-anyhow = { workspace = true }
-clap = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-sha2 = { workspace = true }
-spindle-extension-sdk = { workspace = true }
-thiserror = { workspace = true }
-uuid = { workspace = true }
-
-[lints.rust]
+[workspace.lints.rust]
 unsafe_code = "forbid"
 unused_must_use = "deny"
 
-[lints.clippy]
-# Deny footguns and half-finished code paths
+[workspace.lints.clippy]
 dbg_macro = "deny"
 expect_used = "deny"
 infinite_loop = "deny"
@@ -58,7 +35,5 @@ implicit_clone = "deny"
 todo = "deny"
 unimplemented = "deny"
 unwrap_used = "deny"
-
-# Stricter API / docs hygiene (warnings promoted to errors via -D warnings in task lint)
 missing_errors_doc = "warn"
 missing_panics_doc = "warn"

@@ -317,13 +317,7 @@ fn resolve_install_manifest(extension: &std::path::Path) -> PathBuf {
         return extension.join("extension.json");
     }
 
-    if extension.exists() {
-        return extension.to_path_buf();
-    }
-
-    PathBuf::from("extensions")
-        .join(extension)
-        .join("extension.json")
+    extension.to_path_buf()
 }
 
 #[cfg(test)]
@@ -436,10 +430,20 @@ done
     }
 
     #[test]
-    fn install_name_resolves_to_builtin_extension_manifest() {
+    fn install_directory_resolves_to_extension_manifest() -> Result<()> {
+        let dir = crate::store::tests_support::test_dir()?;
+        fs::create_dir_all(&dir)?;
         assert_eq!(
-            resolve_install_manifest(std::path::Path::new("aerospace")),
-            PathBuf::from("extensions/aerospace/extension.json")
+            resolve_install_manifest(dir.as_path()),
+            dir.join("extension.json")
         );
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn install_manifest_path_is_used_as_is() {
+        let path = PathBuf::from("/tmp/my-extension/extension.json");
+        assert_eq!(resolve_install_manifest(path.as_path()), path);
     }
 }

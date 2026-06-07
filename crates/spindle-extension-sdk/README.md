@@ -1,6 +1,7 @@
 # spindle-extension-sdk
 
-Typed stdio-host contract shared by the spindle core and official extensions.
+Typed stdio-host contract shared by the spindle kernel (`crates/spindle`) and
+extension hosts.
 
 During install, extension hosts return an `ExtensionRegistration` from a
 `register` request to declare emitted events, produced action-output events,

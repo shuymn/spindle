@@ -3,7 +3,7 @@
 `spindle` は、macOS のローカル自動化をイベント・アクション・拡張でつなぐ小さなハーネスです。
 
 中心にあるのは、特定のアプリ連携を直接持たないカーネルです。カーネルはイベントを保存し、拡張の登録情報を検証し、イベントからアクションへのルートを実行します。
-`AeroSpace`、`SketchyBar`、Raycast、エージェントのフックなど、実際のワークフローは拡張として外に置きます。
+アプリ連携、外部ツール連携、エージェントのフックなど、実際のワークフローは拡張として外に置きます。
 
 ## 何をするものか
 
@@ -17,23 +17,19 @@
   -> アクションが出したイベントをさらに dispatch する
 ```
 
-たとえば公式拡張を組み合わせると、次の流れを構成できます。
+たとえば複数の拡張を組み合わせると、次の流れを構成できます。
 
 ```text
-aerospace.workspace.changed / aerospace.monitor.changed
-  -> workspace-indicator.workspaces.schedule
-  -> extension-owned latest-wins scheduler
-  -> aerospace.workspace.snapshot
-  -> workspace-indicator.workspaces.render
-  -> workspace-indicator.sketchybar.message.requested
-  -> sketchybar.message.send
+provider.event.changed
+  -> workflow.prepare
+  -> workflow.render
+  -> notifier.message.send
 
-sketchybar.workspace.clicked
-  -> aerospace.workspace.focus
+ui.item.clicked
+  -> provider.item.focus
 ```
 
-この構成では、`AeroSpace` 拡張は AeroSpace IPC だけを扱い、`SketchyBar` 拡張は SketchyBar IPC だけを扱います。
-ワークスペース表示の色・ラベル・キャッシュキーなどの投影ロジックと、rapid switching 時に中間状態を捨てる latest-wins debounce 方針は `workspace-indicator` 拡張の scheduler が持ちます。
+この構成では、各 provider 拡張は外部プロトコルだけを扱い、workflow 拡張は投影ロジックや debounce 方針を持ちます。カーネルはそれらの登録情報と capability policy を検証し、イベントからアクションへの dispatch だけを担います。
 
 ## カーネルが持つ責務
 
@@ -56,14 +52,14 @@ sketchybar.workspace.clicked
 | 除外する機能 | コアに含めない理由 | 拡張パス |
 |--------------|-------------------|----------|
 | イベントフィルタリング | フィルタ条件はワークフローごとに異なり、コアが関与すると変更のたびに再ビルドが必要になる。ルートの `source` マッチで十分 | ルート定義の `source` フィールドで実現 |
-| テンプレートエンジン | メッセージ形式や表示ロジックはドメイン固有。コアが特定のテンプレート言語を持つと、拡張の表現力を制限する | 各拡張が自身のレンダリングロジックを持つ（例: `workspace-indicator` が SketchyBar メッセージを生成） |
+| テンプレートエンジン | メッセージ形式や表示ロジックはドメイン固有。コアが特定のテンプレート言語を持つと、拡張の表現力を制限する | 各拡張が自身のレンダリングロジックを持つ |
 | リトライ・再実行 | リトライ戦略（回数・間隔・バックオフ）はアクションの性質に依存し、コアの固定ロジックでは不十分 | 拡張側で実装するか、将来の命令面設定（リトライポリシー）で宣言的に指定 |
-| 条件分岐（if/else） | 分岐ロジックをコアが持つと、拡張が自由にワークフローを構成できなくなる。分岐はワークフロー拡張の責務 | `workspace-indicator` のような workflow 拡張が action output で分岐を実現 |
+| 条件分岐（if/else） | 分岐ロジックをコアが持つと、拡張が自由にワークフローを構成できなくなる。分岐はワークフロー拡張の責務 | workflow 拡張が action output で分岐を実現 |
 | ワークフロー固有状態 | 進捗カウンタや中間状態をコアが保持すると、拡張間の暗黙的結合が生まれ、テストと再利用が困難になる | 各拡張が自身の状態を持つか、イベントログから必要な情報をクエリ |
 | スケジューリング・タイマー | 定期実行の要件は外部ツール（launchd, cron）の責務。コアに取り込むとプロセス管理が複雑化する | 外部トリガーから `emit` または `invoke` を発行 |
 | 通知・アラート | 通知先（OS通知、Webhook、メッセージング）は環境ごとに異なり、コアが全経路を持つと肥大化する | 通知用拡張を追加するか、既存拡張の action output を通知先にルート |
 | イベント永続化ポリシー（保持期間・ローテーション） | 保持ポリシーは運用要件であり、コアの責務ではない | 外部ツールによるログローテーション、またはログ読み取り拡張 |
-| サードパーティプロトコル（AeroSpace IPC, SketchyBar Mach IPC） | 特定アプリケーションのプロトコル実装をコアに含めると、未使用時も依存が残り、新規プロトコル追加のたびにコア変更が必要になる | `extensions/aerospace/`、`extensions/sketchybar/` が各プロトコルを実装 |
+| サードパーティプロトコル | 特定アプリケーションのプロトコル実装をコアに含めると、未使用時も依存が残り、新規プロトコル追加のたびにコア変更が必要になる | 各プロトコル用の拡張が実装する |
 | プラグインの動的ロード（dlopen） | プロセス内動的ロードは安全性の境界が曖昧で、クラッシュがコア全体に波及する | stdio JSONL によるプロセス分離（拡張ごとに独立した子プロセス） |
 
 ### 判断基準
@@ -78,12 +74,19 @@ sketchybar.workspace.clicked
 
 ## ワークスペース構成
 
-- `src/` — `spindle` カーネル、CLI、socket server
-- `crates/spindle-extension-sdk/` — stdio JSONL 拡張ホスト用の型付き SDK
-- `extensions/aerospace/` — AeroSpace IPC と workspace/mode/layout snapshot、workspace focus
-- `extensions/sketchybar/` — SketchyBar Mach IPC と generic message send
-- `extensions/workspace-indicator/` — AeroSpace 状態を SketchyBar message request に変換する workflow 拡張
-- `examples/` — manifest 例と小さな実験用コード
+このリポジトリはカーネルと拡張 SDK だけを持ちます。アプリ連携やワークフローは拡張として別途ビルド・インストールします。
+
+```text
+spindle/
+  crates/spindle/                daemon カーネル、CLI、socket server
+  crates/spindle-extension-sdk/  stdio JSONL 拡張ホスト用の型付き SDK
+```
+
+- `crates/spindle/` — イベントログ、dispatch、manifest 検証、daemon
+- `crates/spindle-extension-sdk/` — カーネルと拡張ホストが共有する contract 型
+- `crates/spindle/examples/` — ベンチマークと小さな実験用コード
+
+`spindle-extension-sdk` は拡張作者向けのライブラリです。`crates/spindle` は daemon 本体で、SDK に依存して拡張 contract を検証・実行します。
 
 ## セットアップ
 
@@ -109,20 +112,20 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 ```
 
-release ビルドで公式拡張の entrypoint が `target/release/` に作られます。
+release ビルドでは `spindle` バイナリが `target/release/` に作られます。
 
 ```bash
 cargo build --workspace --release --locked
 ```
 
-stdio dispatch benchmark は workspace-indicator の実行ファイルを明示する必要があります。
+stdio dispatch benchmark は、ベンチ対象の stdio 拡張バイナリを明示する必要があります。
 
 ```bash
-SPINDLE_WORKSPACE_INDICATOR_BIN=target/release/spindle-workspace-indicator \
-  cargo run --example perf --release
+SPINDLE_BENCH_EXTENSION_BIN=/path/to/bench-extension \
+  cargo run -p spindle --example perf --release
 ```
 
-`SPINDLE_WORKSPACE_INDICATOR_BIN` is required for stdio dispatch benchmark. Build `spindle-workspace-indicator` first and pass its path via `SPINDLE_WORKSPACE_INDICATOR_BIN`.
+`SPINDLE_BENCH_EXTENSION_BIN` is required for stdio dispatch benchmark. Build a stdio JSONL extension exposing `bench.render` and pass its path via `SPINDLE_BENCH_EXTENSION_BIN`.
 
 ## 基本的な使い方
 
@@ -148,7 +151,7 @@ chmod 600 "$SPINDLE_STATE_DIR/capabilities.json"
 イベントを追加します。
 
 ```bash
-cargo run -- emit \
+cargo run -p spindle -- emit \
   --type agent.status.changed \
   --source pi \
   --data '{"state":"working","message":"cargo test"}'
@@ -157,20 +160,20 @@ cargo run -- emit \
 イベントを読むには `query events` を使います。
 
 ```bash
-cargo run -- query events --type agent.status.changed
-cargo run -- query events --source pi --limit 5
+cargo run -p spindle -- query events --type agent.status.changed
+cargo run -p spindle -- query events --source pi --limit 5
 ```
 
 daemon を起動すると、同じ request contract を Unix socket 経由で使えます。
 
 ```bash
-cargo run -- daemon
+cargo run -p spindle -- daemon
 ```
 
 別の shell から JSONL request を送ります。
 
 ```bash
-cargo run -- send \
+cargo run -p spindle -- send \
   --request '{"command":"emit","type":"agent.status.changed","source":"pi","data":{"state":"testing"}}'
 ```
 
@@ -178,97 +181,19 @@ socket path は既定で `<state-dir>/spindle.sock` です。`--socket` で明�
 
 ## 拡張をインストールする
 
-公式拡張を使う場合は、先に state directory と capability policy を作ります。
+拡張は manifest path か、manifest を含むディレクトリを指定してインストールします。
+
+manifest path か manifest を含むディレクトリを渡します。
 
 ```bash
-export SPINDLE_STATE_DIR="${SPINDLE_STATE_DIR:-$HOME/.local/state/spindle}"
-mkdir -p "$SPINDLE_STATE_DIR"
-chmod 700 "$SPINDLE_STATE_DIR"
-
-cat > "$SPINDLE_STATE_DIR/capabilities.json" <<'JSON'
-{
-  "emits": {
-    "aerospace": [
-      "aerospace.workspace.changed",
-      "aerospace.focus.changed",
-      "aerospace.monitor.changed",
-      "aerospace.mode.changed",
-      "aerospace.layout.changed"
-    ],
-    "sketchybar": [
-      "sketchybar.workspace.clicked"
-    ],
-    "pi": [
-      "agent.status.changed"
-    ]
-  },
-  "direct": {
-    "raycast": [
-      "aerospace.window.control"
-    ]
-  },
-  "routes": {
-    "workspace-indicator": [
-      {
-        "source": "aerospace",
-        "event": "aerospace.workspace.changed",
-        "capabilities": ["aerospace.state.read"]
-      },
-      {
-        "source": "aerospace",
-        "event": "aerospace.monitor.changed",
-        "capabilities": ["aerospace.state.read"]
-      },
-      {
-        "source": "aerospace",
-        "event": "aerospace.mode.changed",
-        "capabilities": ["aerospace.state.read"]
-      },
-      {
-        "source": "aerospace",
-        "event": "aerospace.focus.changed",
-        "capabilities": ["aerospace.state.read"]
-      },
-      {
-        "source": "aerospace",
-        "event": "aerospace.layout.changed",
-        "capabilities": ["aerospace.state.read"]
-      },
-      {
-        "source": "workspace-indicator",
-        "event": "workspace-indicator.sketchybar.message.requested",
-        "capabilities": ["sketchybar.ui.write"]
-      },
-      {
-        "source": "sketchybar",
-        "event": "sketchybar.workspace.clicked",
-        "capabilities": ["aerospace.window.control"]
-      }
-    ]
-  }
-}
-JSON
-chmod 600 "$SPINDLE_STATE_DIR/capabilities.json"
-
-cargo build --workspace --release --locked
-cargo run -- install --trust-runtime aerospace
-cargo run -- install --trust-runtime sketchybar
-cargo run -- install --trust-runtime workspace-indicator
-cargo run -- extension list
-```
-
-`install aerospace` のように名前だけを渡すと、`extensions/<name>/extension.json` を読みます。
-manifest path や manifest を含むディレクトリも指定できます。
-
-```bash
-cargo run -- install extensions/aerospace/extension.json
-cargo run -- install extensions/aerospace
+cargo run -p spindle -- install /path/to/my-extension/extension.json
+cargo run -p spindle -- install /path/to/my-extension
 ```
 
 manifest を検証するだけなら、拡張ホストは起動されません。
 
 ```bash
-cargo run -- extension validate extensions/aerospace/extension.json
+cargo run -p spindle -- extension validate /path/to/my-extension/extension.json
 ```
 
 `extension validate` は static manifest だけを読み、entrypoint は起動しません。
@@ -283,60 +208,21 @@ registry に書かず dynamic surface だけを見るには `extension surface -
 さらに、その grant は state directory の `capabilities.json` で許可されている必要があります。
 route capability は dispatch 時だけでなく、extension の install / register 時にも検査されます。
 route grant policy は route owner extension id ごとに、許可する event `source` / event kind / capabilities を指定します。
-たとえば `workspace-indicator` は aerospace provider event への route で `aerospace.state.read` を grant し、自身が emit する `workspace-indicator.sketchybar.message.requested` への route で `sketchybar.ui.write` を grant し、SketchyBar click event への route で `aerospace.window.control` を grant するため、install 前に `capabilities.json` の `routes.workspace-indicator` を設定してください。
 
 ```json
 {
   "emits": {
-    "aerospace": [
-      "aerospace.workspace.changed",
-      "aerospace.focus.changed",
-      "aerospace.monitor.changed",
-      "aerospace.mode.changed",
-      "aerospace.layout.changed"
-    ],
-    "pi": ["agent.status.changed"],
-    "sketchybar": ["sketchybar.workspace.clicked"]
+    "local-tool": ["local-tool.item.changed"]
   },
   "direct": {
-    "raycast": ["aerospace.window.control"]
+    "launcher": ["local-tool.item.write"]
   },
   "routes": {
-    "workspace-indicator": [
+    "workflow": [
       {
-        "source": "aerospace",
-        "event": "aerospace.workspace.changed",
-        "capabilities": ["aerospace.state.read"]
-      },
-      {
-        "source": "aerospace",
-        "event": "aerospace.monitor.changed",
-        "capabilities": ["aerospace.state.read"]
-      },
-      {
-        "source": "aerospace",
-        "event": "aerospace.mode.changed",
-        "capabilities": ["aerospace.state.read"]
-      },
-      {
-        "source": "aerospace",
-        "event": "aerospace.focus.changed",
-        "capabilities": ["aerospace.state.read"]
-      },
-      {
-        "source": "aerospace",
-        "event": "aerospace.layout.changed",
-        "capabilities": ["aerospace.state.read"]
-      },
-      {
-        "source": "workspace-indicator",
-        "event": "workspace-indicator.sketchybar.message.requested",
-        "capabilities": ["sketchybar.ui.write"]
-      },
-      {
-        "source": "sketchybar",
-        "event": "sketchybar.workspace.clicked",
-        "capabilities": ["aerospace.window.control"]
+        "source": "local-tool",
+        "event": "local-tool.item.changed",
+        "capabilities": ["local-tool.item.read"]
       }
     ]
   }
@@ -348,10 +234,10 @@ route grant policy は route owner extension id ごとに、許可する event `
 直接アクションを呼ぶ例です。
 
 ```bash
-cargo run -- invoke \
-  --action aerospace.workspace.focus \
-  --source raycast \
-  --capability aerospace.window.control \
+cargo run -p spindle -- invoke \
+  --action local-tool.item.write \
+  --source launcher \
+  --capability local-tool.item.write \
   --args '{"name":"dev"}'
 ```
 
@@ -369,25 +255,25 @@ entrypoint change detection が必要な場合は `--trust-runtime` で登録し
 
 ```json
 {
-  "id": "sketchybar",
+  "id": "my-extension",
   "version": "0.1.0",
-  "entrypoint": "../../target/release/spindle-sketchybar",
+  "entrypoint": "./target/release/my-extension",
   "runtime": "stdio-jsonl"
 }
 ```
 
-実際の event/action/capability は、manifest に静的に書くこともできますが、公式拡張では SDK を使って拡張コードから登録します。
+実際の event/action/capability は、manifest に静的に書くこともできますが、stdio JSONL 拡張では SDK を使って拡張コードから登録するのが一般的です。
 `emits` は拡張が外部入力や IPC から観測して発火できる event kind、`produces` は拡張 action の `ActionOutput` が返せる event kind です。
 どちらも event surface の所有権として扱われるため、同じ event kind を別拡張が `emits` / `produces` のどちらかで重複登録することはできません。
 
 ```rust
 ExtensionRegistration::new()
-    .emit("sketchybar.workspace.clicked")
-    .produce("sketchybar.message.sent")
-    .capability("sketchybar.ui.write")
+    .emit("local-tool.item.changed")
+    .produce("notifier.message.requested")
+    .capability("notifier.message.write")
     .action(
-        "sketchybar.message.send",
-        RegistrationAction::new().capability("sketchybar.ui.write"),
+        "notifier.message.send",
+        RegistrationAction::new().capability("notifier.message.write"),
     )
 ```
 
@@ -395,10 +281,10 @@ ExtensionRegistration::new()
 
 ```json
 {
-  "event": "sketchybar.workspace.clicked",
-  "source": "sketchybar",
-  "action": "aerospace.workspace.focus",
-  "capabilities": ["aerospace.window.control"],
+  "event": "local-tool.item.changed",
+  "source": "local-tool",
+  "action": "workflow.item.render",
+  "capabilities": ["local-tool.item.read"],
   "args": {}
 }
 ```
@@ -426,40 +312,6 @@ continuation は original invocation の capability grant に限定され、core
 `ActionContext::extension()` には daemon が見ている installed surface が入ります。
 workflow 拡張はこれを使って、必要な provider event や action があるかを実行時に確認できます。
 `ActionContext::continuation()` には、deferred work を行うための短命 continuation handle が入ります。
-
-## 公式拡張
-
-### `aerospace`
-
-AeroSpace の Unix socket IPC を扱います。
-
-主な surface:
-
-- emits: `aerospace.workspace.changed`, `aerospace.focus.changed`, `aerospace.monitor.changed`,
-  `aerospace.mode.changed`, `aerospace.layout.changed`
-- produces: `aerospace.workspace.snapshot`, `aerospace.mode.snapshot`, `aerospace.layout.snapshot`
-- actions: `aerospace.workspace.focus`, `aerospace.workspace.snapshot`,
-  `aerospace.mode.snapshot`, `aerospace.layout.snapshot`
-- capabilities: `aerospace.state.read`, `aerospace.window.control`
-
-### `sketchybar`
-
-SketchyBar の Mach IPC を扱います。SketchyBar CLI を毎回 spawn せず、NUL 区切りの message payload を直接送ります。
-
-主な surface:
-
-- emits: `sketchybar.workspace.clicked`
-- actions: `sketchybar.message.send`
-- capabilities: `sketchybar.ui.write`
-
-`sketchybar.message.send` は `cache_key` / `cache_value` を受けると、同じ内容の再送を抑制します。
-
-### `workspace-indicator`
-
-Provider I/O は行わない workflow 拡張です。
-AeroSpace snapshot を SketchyBar message request に変換し、`workspace-indicator.sketchybar.message.requested` を action output として produce します。
-
-既定の workspace list は `1,2,3,4,5,6,7,8,9,10` です。
 
 ## 状態ファイル
 

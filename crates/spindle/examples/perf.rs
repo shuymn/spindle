@@ -24,7 +24,7 @@ const CONCURRENT_APPENDS_PER_THREAD: usize = 50;
 const REGISTRY_INSTALLS: usize = 50;
 const REGISTRY_LIST_ITERS: usize = 500;
 const STDIO_DISPATCH_ITERS: usize = 1_000;
-const WORKSPACE_INDICATOR_BIN_ENV: &str = "SPINDLE_WORKSPACE_INDICATOR_BIN";
+const BENCH_EXTENSION_BIN_ENV: &str = "SPINDLE_BENCH_EXTENSION_BIN";
 
 fn main() -> Result<()> {
     let root = temp_dir("spindle-perf")?;
@@ -179,8 +179,7 @@ fn measure_stdio_dispatch(root: &Path) -> Result<()> {
 
     let cold_elapsed = measure(|| {
         let dispatcher = Dispatcher::new(&registry, &runtime);
-        let reports =
-            dispatcher.dispatch_action("workspace-indicator.workspaces.render", &args, &[])?;
+        let reports = dispatcher.dispatch_action("bench.render", &args, &[])?;
         black_box(reports.len());
         Ok(())
     })?;
@@ -189,8 +188,7 @@ fn measure_stdio_dispatch(root: &Path) -> Result<()> {
     let hot_elapsed = measure(|| {
         for _ in 0..STDIO_DISPATCH_ITERS {
             let dispatcher = Dispatcher::new(&registry, &runtime);
-            let reports =
-                dispatcher.dispatch_action("workspace-indicator.workspaces.render", &args, &[])?;
+            let reports = dispatcher.dispatch_action("bench.render", &args, &[])?;
             black_box(reports.len());
         }
         Ok(())
@@ -251,21 +249,21 @@ fn write_recipe_manifests(dir: &Path, count: usize) -> Result<Vec<PathBuf>> {
 }
 
 fn write_dispatch_registry(registry: &ExtensionRegistry, dir: &Path) -> Result<()> {
-    let workspace_entrypoint = workspace_indicator_entrypoint()?;
+    let bench_entrypoint = bench_extension_entrypoint()?;
     let entries = vec![
         RegisteredExtension {
-            id: String::from("sketchybar"),
+            id: String::from("bench-notifier"),
             version: String::from("0.1.0"),
-            manifest_path: dir.join("sketchybar.json"),
+            manifest_path: dir.join("bench-notifier.json"),
             runtime: ExtensionRuntime::StdioJsonl,
             entrypoint: Some(String::from("/usr/bin/true")),
-            capabilities: vec![String::from("sketchybar.ui.write")],
+            capabilities: vec![String::from("bench.message.write")],
             emits: Vec::new(),
             produces: Vec::new(),
             actions: [(
-                String::from("sketchybar.message.send"),
+                String::from("bench.message.send"),
                 ExtensionAction {
-                    capabilities: vec![String::from("sketchybar.ui.write")],
+                    capabilities: vec![String::from("bench.message.write")],
                 },
             )]
             .into(),
@@ -273,30 +271,20 @@ fn write_dispatch_registry(registry: &ExtensionRegistry, dir: &Path) -> Result<(
             runtime_trust: None,
         },
         RegisteredExtension {
-            id: String::from("workspace-indicator"),
+            id: String::from("bench-renderer"),
             version: String::from("0.1.0"),
-            manifest_path: dir.join("workspace-indicator.json"),
+            manifest_path: dir.join("bench-renderer.json"),
             runtime: ExtensionRuntime::StdioJsonl,
-            entrypoint: Some(workspace_entrypoint.to_string_lossy().into_owned()),
+            entrypoint: Some(bench_entrypoint.to_string_lossy().into_owned()),
             capabilities: Vec::new(),
             emits: Vec::new(),
-            produces: vec![String::from(
-                "workspace-indicator.sketchybar.message.requested",
-            )],
-            actions: BTreeMap::from([
-                (
-                    String::from("workspace-indicator.status.render"),
-                    ExtensionAction {
-                        capabilities: Vec::new(),
-                    },
-                ),
-                (
-                    String::from("workspace-indicator.workspaces.render"),
-                    ExtensionAction {
-                        capabilities: Vec::new(),
-                    },
-                ),
-            ]),
+            produces: vec![String::from("bench.message.requested")],
+            actions: BTreeMap::from([(
+                String::from("bench.render"),
+                ExtensionAction {
+                    capabilities: Vec::new(),
+                },
+            )]),
             routes: Vec::<ExtensionRoute>::new(),
             runtime_trust: None,
         },
@@ -306,10 +294,10 @@ fn write_dispatch_registry(registry: &ExtensionRegistry, dir: &Path) -> Result<(
     Ok(())
 }
 
-fn workspace_indicator_entrypoint() -> Result<PathBuf> {
-    let path = env::var_os(WORKSPACE_INDICATOR_BIN_ENV).with_context(|| {
+fn bench_extension_entrypoint() -> Result<PathBuf> {
+    let path = env::var_os(BENCH_EXTENSION_BIN_ENV).with_context(|| {
         format!(
-            "{WORKSPACE_INDICATOR_BIN_ENV} is required for stdio dispatch benchmark. Build spindle-workspace-indicator first and pass its path via {WORKSPACE_INDICATOR_BIN_ENV}."
+            "{BENCH_EXTENSION_BIN_ENV} is required for stdio dispatch benchmark. Build a stdio JSONL extension exposing bench.render and pass its path via {BENCH_EXTENSION_BIN_ENV}."
         )
     })?;
     Ok(PathBuf::from(path))

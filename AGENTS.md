@@ -18,8 +18,7 @@
 - Read `docs/adr/` only when historical rationale matters to the task.
 - `unwrap`, `expect`, `todo`, and `dbg!` are denied across the workspace, including tests.
   Prefer `Result` tests and `?`.
-- `unsafe_code` is forbidden in most crates. The SketchyBar Mach IPC FFI is the narrow exception.
-  Keep unsafe localized, justified nearby, and behind a safe public API.
+- `unsafe_code` is forbidden in this workspace.
 
 ## Commands
 

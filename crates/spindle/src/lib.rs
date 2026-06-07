@@ -1,9 +1,7 @@
-//! Minimal local automation harness primitives.
+//! Spindle daemon kernel: event log, manifest validation, and route dispatch.
 //!
-//! `spindle` keeps the core small: it records events, validates extension
-//! manifests, and dispatches installed actions through generic routes. Concrete
-//! integrations such as `AeroSpace`, `SketchyBar`, `Glimpse`, `Raycast`, and
-//! coding-agent hooks should live in extensions rather than in the kernel.
+//! Extension hosts use the sibling `spindle-extension-sdk` crate for the stdio
+//! JSONL contract.
 
 #![warn(clippy::pedantic)]
 #![warn(clippy::nursery)]
