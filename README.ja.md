@@ -52,17 +52,6 @@ export SPINDLE_STATE_DIR=/tmp/spindle
 mkdir -p "$SPINDLE_STATE_DIR"
 chmod 700 "$SPINDLE_STATE_DIR"
 
-cat > "$SPINDLE_STATE_DIR/capabilities.json" <<'JSON'
-{
-  "emits": {
-    "pi": ["agent.status.changed"]
-  },
-  "direct": {},
-  "routes": {}
-}
-JSON
-chmod 600 "$SPINDLE_STATE_DIR/capabilities.json"
-
 cargo run -p spindle -- emit \
   --type agent.status.changed \
   --source pi \
@@ -71,10 +60,14 @@ cargo run -p spindle -- emit \
 cargo run -p spindle -- query events --type agent.status.changed
 ```
 
+## セキュリティモデル
+
+拡張パッケージをインストールすることは、その実行コードを自分のユーザー権限で動かすと信頼することです。ユーザーの spindle socket に到達できるローカルクライアントは event を emit できます。event の `source` は routing label であり、認証主体ではありません。manifest route の `source` は、インストール済みでその event を所有する extension と照合されます。capability が必要な action 実行は、別の policy file ではなく、インストール済み route 宣言と continuation grant で認可します。
+
 ## ドキュメント
 
 - [Concepts](docs/concepts.md) — カーネルの責務、拡張境界、コアに含めないもの
-- [Usage](docs/usage.md) — setup、CLI 例、capability policy、状態ファイル
+- [Usage](docs/usage.md) — setup、CLI 例、trusted local automation model、状態ファイル
 - [Extensions](docs/extensions.md) — manifest、登録 surface、route、continuation、stdio JSONL host
 - [Extension SDK README](crates/spindle-extension-sdk/README.md) — SDK package notes
 

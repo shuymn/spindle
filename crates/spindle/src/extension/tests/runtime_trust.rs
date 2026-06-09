@@ -6,7 +6,7 @@ use spindle_test_host::{StartupAction, TestHostConfig};
 use super::*;
 
 #[test]
-fn registry_authorizes_installed_route_grants() -> Result<(), SpindleError> {
+fn registry_accepts_installed_route_grants_without_policy() -> Result<(), SpindleError> {
     let dir = crate::store::tests_support::test_dir()?;
     fs::create_dir_all(&dir)?;
     let workflow = write_static_manifest_with_surface(
@@ -59,23 +59,20 @@ fn registry_authorizes_installed_route_grants() -> Result<(), SpindleError> {
           }
         }"#,
     )?;
-    crate::store::tests_support::write_capability_policy(
-        &dir,
-        r#"{"emits":{"provider":["provider.changed"]},"direct":{},"routes":{"workflow":[{"source":"provider","event":"provider.changed","capabilities":["provider.read"]}]}}"#,
-    )?;
-
     let registry = ExtensionRegistry::in_dir(&dir);
     registry.install_manifest(&provider)?;
     let registered = registry.install_manifest(&workflow)?;
-    let policy = crate::CapabilityPolicy::load(&dir)?;
 
-    policy.ensure_route_grants(&registered)?;
+    assert_eq!(
+        registered.routes[0].capabilities,
+        vec![String::from("provider.read")]
+    );
     fs::remove_dir_all(dir)?;
     Ok(())
 }
 
 #[test]
-fn static_registration_rejects_ungranted_route_capabilities() -> Result<(), SpindleError> {
+fn static_registration_accepts_route_capabilities_without_policy() -> Result<(), SpindleError> {
     let dir = crate::store::tests_support::test_dir()?;
     fs::create_dir_all(&dir)?;
     let workflow = write_static_manifest_with_surface(
@@ -105,18 +102,19 @@ fn static_registration_rejects_ungranted_route_capabilities() -> Result<(), Spin
         }"#,
     )?;
 
-    let result = ExtensionRegistry::in_dir(&dir).install_manifest(&workflow);
+    let registered = ExtensionRegistry::in_dir(&dir).install_manifest(&workflow)?;
 
-    assert!(matches!(
-        result,
-        Err(SpindleError::CapabilityGrantDenied { .. })
-    ));
+    assert_eq!(
+        registered.routes[0].capabilities,
+        vec![String::from("provider.read")]
+    );
     fs::remove_dir_all(dir)?;
     Ok(())
 }
 
 #[test]
-fn trusted_runtime_registration_rejects_ungranted_route_capabilities() -> Result<(), SpindleError> {
+fn trusted_runtime_registration_accepts_route_capabilities_without_policy()
+-> Result<(), SpindleError> {
     let dir = crate::store::tests_support::test_dir()?;
     fs::create_dir_all(&dir)?;
     let host = dir.join("route-host.sh");
@@ -139,12 +137,14 @@ done
     let package = write_stdio_package(&dir, "route-host", &host)?;
     let runtime = ExtensionRuntimeHost::new();
 
-    let result = ExtensionRegistry::in_dir(&dir).install_manifest_with_runtime(&package, &runtime);
+    let registered =
+        ExtensionRegistry::in_dir(&dir).install_manifest_with_runtime(&package, &runtime)?;
 
-    assert!(matches!(
-        result,
-        Err(SpindleError::CapabilityGrantDenied { .. })
-    ));
+    assert_eq!(
+        registered.routes[0].capabilities,
+        vec![String::from("provider.read")]
+    );
+    runtime.shutdown()?;
     fs::remove_dir_all(dir)?;
     Ok(())
 }

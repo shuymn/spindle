@@ -15,9 +15,9 @@ use std::{
 use crate::{
     ContinuationConfig, ContinuationStore, EventLog, ExtensionRegistry, ExtensionRuntimeHost,
     HubRequest, HubResponse, SpindleError, execute_request_with_continuations,
-    policy::validate_installed_registry,
     protocol::{DEFAULT_JSONL_MESSAGE_LIMIT, read_limited_jsonl_line},
     store::ensure_private_parent,
+    validate_installed_registry,
 };
 
 const DEFAULT_STREAM_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -174,7 +174,7 @@ fn registry_for_log(log: &EventLog) -> ExtensionRegistry {
     ExtensionRegistry::in_dir(log.state_dir())
 }
 
-fn prepare_socket(socket_path: &Path) -> Result<(), SpindleError> {
+pub fn prepare_socket(socket_path: &Path) -> Result<(), SpindleError> {
     let Some(_parent) = socket_path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -190,6 +190,10 @@ fn prepare_socket(socket_path: &Path) -> Result<(), SpindleError> {
         "socket parent directory must be private",
     )?;
 
+    remove_stale_socket(socket_path)
+}
+
+fn remove_stale_socket(socket_path: &Path) -> Result<(), SpindleError> {
     if !socket_path.exists() {
         return Ok(());
     }
@@ -298,10 +302,6 @@ mod tests {
         fs::create_dir_all(&dir)?;
         let socket = dir.join("spindle.sock");
         let log = EventLog::in_dir(&dir);
-        crate::store::tests_support::write_capability_policy(
-            &dir,
-            r#"{"emits":{"pi":["agent.status.changed"]},"direct":{},"routes":{}}"#,
-        )?;
         let server_state = ServerState::new(log.clone(), socket.clone());
         let listener = UnixListener::bind(&socket)?;
 
@@ -477,17 +477,9 @@ mod tests {
     fn daemon_reuses_stdio_hosts_across_client_connections() -> Result<(), SpindleError> {
         let dir = crate::store::tests_support::test_dir()?;
         fs::create_dir_all(&dir)?;
-        crate::store::tests_support::write_capability_policy(
-            &dir,
-            r#"{"emits":{},"direct":{"test-client":["test.write"]},"routes":{}}"#,
-        )?;
         let registration = ExtensionRegistration::new()
             .produce("test.rendered")
-            .capability("test.write")
-            .action(
-                "test.render",
-                RegistrationAction::new().capability("test.write"),
-            );
+            .action("test.render", RegistrationAction::new());
         let host = crate::store::tests_support::install_test_host(
             &dir,
             "host",
@@ -542,7 +534,6 @@ mod tests {
             &HubRequest::Invoke {
                 action: String::from("test.render"),
                 source: String::from("test-client"),
-                capabilities: vec![String::from("test.write")],
                 args: json!({}),
             },
         )?;
@@ -551,7 +542,6 @@ mod tests {
             &HubRequest::Invoke {
                 action: String::from("test.render"),
                 source: String::from("test-client"),
-                capabilities: vec![String::from("test.write")],
                 args: json!({}),
             },
         )?;

@@ -46,9 +46,6 @@ pub enum HubRequest {
         action: String,
         /// Logical requester.
         source: String,
-        /// Capabilities granted to this direct action request.
-        #[serde(default)]
-        capabilities: Vec<String>,
         /// Action arguments.
         #[serde(default = "empty_object")]
         args: Value,

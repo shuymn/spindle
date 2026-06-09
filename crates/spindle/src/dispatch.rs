@@ -8,8 +8,8 @@ use spindle_extension_sdk::{
 };
 
 use crate::{
-    CapabilityPolicy, ContinuationConfig, Event, EventLog, ExtensionAction, ExtensionRegistry,
-    ExtensionRuntime, ExtensionRuntimeHost, RegisteredExtension, SpindleError,
+    ContinuationConfig, Event, EventLog, ExtensionAction, ExtensionRegistry, ExtensionRuntime,
+    ExtensionRuntimeHost, RegisteredExtension, SpindleError,
 };
 
 const MAX_DISPATCH_DEPTH: usize = 16;
@@ -43,7 +43,6 @@ struct ActionDispatchScope<'a> {
 #[derive(Debug)]
 struct InstalledSurface {
     extensions: Vec<RegisteredExtension>,
-    policy: CapabilityPolicy,
     visible_context: ExtensionVisibleContext,
     action_owners: BTreeMap<String, usize>,
     event_routes: BTreeMap<String, Vec<RouteHandler>>,
@@ -121,8 +120,7 @@ impl<'a> Dispatcher<'a> {
         }
 
         let mut reports = Vec::new();
-        for (extension, route) in surface.routes_for_event(event) {
-            surface.ensure_route_capabilities(extension, route)?;
+        for route in surface.routes_for_event(event) {
             let args = merge_args(&event.data, &route.args);
             reports.extend(self.dispatch_action_from(
                 &route.action,
@@ -239,13 +237,11 @@ impl<'a> Dispatcher<'a> {
 impl InstalledSurface {
     fn load(registry: &ExtensionRegistry) -> Result<Self, SpindleError> {
         let extensions = registry.list()?;
-        let policy = CapabilityPolicy::load(registry.state_dir())?;
         let visible_context = ExtensionVisibleContext::from_extensions(&extensions);
         let action_owners = action_owners(&extensions);
         let event_routes = event_routes(&extensions);
         Ok(Self {
             extensions,
-            policy,
             visible_context,
             action_owners,
             event_routes,
@@ -255,21 +251,17 @@ impl InstalledSurface {
     fn routes_for_event<'a>(
         &'a self,
         event: &'a Event,
-    ) -> impl Iterator<Item = (&'a RegisteredExtension, &'a crate::ExtensionRoute)> + 'a {
+    ) -> impl Iterator<Item = &'a crate::ExtensionRoute> + 'a {
         self.event_routes
             .get(&event.kind)
             .into_iter()
             .flatten()
-            .filter(move |handler| {
-                let route = &self.extensions[handler.extension].routes[handler.route];
+            .map(|handler| &self.extensions[handler.extension].routes[handler.route])
+            .filter(move |route| {
                 route
                     .source
                     .as_ref()
                     .is_none_or(|source| source == &event.source)
-            })
-            .map(|handler| {
-                let extension = &self.extensions[handler.extension];
-                (extension, &extension.routes[handler.route])
             })
     }
 
@@ -281,14 +273,6 @@ impl InstalledSurface {
             let extension = &self.extensions[*extension_index];
             (extension, &extension.actions[action])
         })
-    }
-
-    fn ensure_route_capabilities(
-        &self,
-        extension: &RegisteredExtension,
-        route: &crate::ExtensionRoute,
-    ) -> Result<(), SpindleError> {
-        self.policy.ensure_route_capabilities(&extension.id, route)
     }
 
     fn context_for(&self, extension: &RegisteredExtension) -> ExtensionContext {
@@ -442,7 +426,11 @@ fn merge_args(event_data: &Value, route_args: &Value) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+        path::{Path, PathBuf},
+    };
 
     use serde_json::json;
     use spindle_extension_sdk::{ActionOutput, ExtensionRegistration, RegistrationAction};
@@ -504,15 +492,102 @@ mod tests {
         Ok(())
     }
 
+    fn write_stdio_package(
+        dir: &Path,
+        id: &str,
+        host: &Path,
+        manifest: &serde_json::Value,
+    ) -> Result<PathBuf, SpindleError> {
+        let package = dir.join(id);
+        fs::create_dir_all(package.join("bin"))?;
+        let staged_host = package.join("bin").join(id);
+        fs::copy(host, &staged_host)?;
+        let host_config = host.with_extension("json");
+        if host_config.is_file() {
+            fs::copy(&host_config, staged_host.with_extension("json"))?;
+        }
+        let mut permissions = fs::metadata(&staged_host)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&staged_host, permissions)?;
+        fs::write(
+            package.join("extension.json"),
+            serde_json::to_string_pretty(&manifest)?,
+        )?;
+        Ok(package)
+    }
+
     #[test]
-    fn recursive_dispatch_reuses_top_level_policy_snapshot() -> Result<(), SpindleError> {
+    fn route_declared_capabilities_authorize_action_without_policy() -> Result<(), SpindleError> {
         let dir = crate::store::tests_support::test_dir()?;
         fs::create_dir_all(&dir)?;
-        let policy_path = dir.join("capabilities.json");
-        crate::store::tests_support::write_capability_policy(
+        let registration = ExtensionRegistration::new().action(
+            "test.render",
+            RegistrationAction::new().capability("test.write"),
+        );
+        let host = crate::store::tests_support::install_test_host(
             &dir,
-            r#"{"emits":{"unit":["test.initial"]},"direct":{},"routes":{"test-recipe":[{"source":"unit","event":"test.initial","capabilities":["test.write"]},{"source":"test-host","event":"test.followup","capabilities":["test.write"]}]}}"#,
+            "policy-free-host",
+            &TestHostConfig::with_registration(registration),
         )?;
+        let host_package = write_stdio_package(
+            &dir,
+            "test-host",
+            &host,
+            &json!({
+                "id": "test-host",
+                "version": "0.1.0",
+                "runtime": "stdio-jsonl",
+                "emits": ["test.changed"]
+            }),
+        )?;
+        let recipe_package = dir.join("test-recipe");
+        fs::create_dir_all(&recipe_package)?;
+        fs::write(
+            recipe_package.join("extension.json"),
+            r#"{
+              "id": "test-recipe",
+              "version": "0.1.0",
+              "runtime": "recipe",
+              "routes": [
+                {
+                  "event": "test.changed",
+                  "source": "test-host",
+                  "action": "test.render",
+                  "capabilities": ["test.write"]
+                }
+              ]
+            }"#,
+        )?;
+        let registry = ExtensionRegistry::in_dir(&dir);
+        let runtime = ExtensionRuntimeHost::new();
+        registry.install_manifest_with_runtime(&host_package, &runtime)?;
+        registry.install_manifest(&recipe_package)?;
+        let event = Event::builder(String::from("test.changed"), String::from("test-host"))
+            .data(json!({}))
+            .build()?;
+        let dispatcher = Dispatcher::new(&registry, &runtime);
+
+        let reports = dispatcher.dispatch_event(&event)?;
+
+        assert_eq!(
+            reports,
+            vec![DispatchReport {
+                action: String::from("test.render"),
+                extension: String::from("test-host")
+            }]
+        );
+        assert!(!dir.join("capabilities.json").exists());
+        runtime.shutdown()?;
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn recursive_dispatch_does_not_depend_on_policy_state() -> Result<(), SpindleError> {
+        let dir = crate::store::tests_support::test_dir()?;
+        fs::create_dir_all(&dir)?;
+        let legacy_policy_path = dir.join("capabilities.json");
+        fs::write(&legacy_policy_path, r#"{"emits":{},"direct":{}}"#)?;
         let registration = ExtensionRegistration::new()
             .produce("test.followup")
             .capability("test.write")
@@ -535,7 +610,7 @@ mod tests {
                         when_invoke_index: None,
                         when_session_index: None,
                         effect: InvokeEffect {
-                            remove_file: Some(policy_path),
+                            remove_file: Some(legacy_policy_path),
                             response: ResponseTemplate::Output {
                                 output: json!({
                                     "events": [{"type": "test.followup", "data": {}}]
@@ -554,24 +629,15 @@ mod tests {
                 ..TestHostConfig::with_registration(registration)
             },
         )?;
-        let host_package = dir.join("test-host");
-        fs::create_dir_all(host_package.join("bin"))?;
-        let staged_host = host_package.join("bin/test-host");
-        fs::copy(&host, &staged_host)?;
-        let host_config = host.with_extension("json");
-        if host_config.is_file() {
-            fs::copy(&host_config, staged_host.with_extension("json"))?;
-        }
-        let mut permissions = fs::metadata(&staged_host)?.permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&staged_host, permissions)?;
-        fs::write(
-            host_package.join("extension.json"),
-            serde_json::to_string_pretty(&json!({
+        let host_package = write_stdio_package(
+            &dir,
+            "test-host",
+            &host,
+            &json!({
                 "id": "test-host",
                 "version": "0.1.0",
                 "runtime": "stdio-jsonl"
-            }))?,
+            }),
         )?;
         let recipe_package = dir.join("test-recipe");
         fs::create_dir_all(&recipe_package)?;

@@ -38,17 +38,6 @@ For experiments, use an explicit state directory.
 export SPINDLE_STATE_DIR=/tmp/spindle
 mkdir -p "$SPINDLE_STATE_DIR"
 chmod 700 "$SPINDLE_STATE_DIR"
-
-cat > "$SPINDLE_STATE_DIR/capabilities.json" <<'JSON'
-{
-  "emits": {
-    "pi": ["agent.status.changed"]
-  },
-  "direct": {},
-  "routes": {}
-}
-JSON
-chmod 600 "$SPINDLE_STATE_DIR/capabilities.json"
 ```
 
 Append an event.
@@ -67,9 +56,12 @@ cargo run -p spindle -- query events --type agent.status.changed
 cargo run -p spindle -- query events --source pi --limit 5
 ```
 
-Start the daemon to use the same request contract over a Unix socket.
+Prepare installed extensions, then start the daemon to use the same request contract over a Unix socket.
 
 ```bash
+cargo run -p spindle -- bootstrap \
+  --extension-dir /path/to/packages \
+  --trust-runtime
 cargo run -p spindle -- daemon
 ```
 
@@ -82,85 +74,32 @@ cargo run -p spindle -- send \
 
 The default socket path is `<state-dir>/spindle.sock`. Use `--socket` to set it explicitly.
 
-## Capability policy
+## Trusted local automation model
 
-When an action requires capabilities, direct invokes and routes must grant those capabilities. The grants must also be allowed by `capabilities.json` in the state directory.
+Installing an extension package is an explicit trust decision. `spindle` stages and runs extension executables with the current user's normal OS permissions. Use OS, container, or other external sandbox boundaries when you need stronger isolation.
 
-Route capabilities are checked both during dispatch and when an extension is installed. Route grant policy is keyed by route owner extension ID and specifies the allowed event `source`, event kind, and capabilities.
+Local clients that can access the user's private spindle socket may emit events. Event `source` is a routing label, not an authentication boundary. Manifest route `source` values are still validated against installed event-owning extensions. Keep the socket and state directory private, and connect only trusted same-user clients/extensions.
 
-```json
-{
-  "emits": {
-    "local-tool": ["local-tool.item.changed"]
-  },
-  "direct": {
-    "launcher": ["local-tool.item.write"]
-  },
-  "routes": {
-    "workflow": [
-      {
-        "source": "local-tool",
-        "event": "local-tool.item.changed",
-        "capabilities": ["local-tool.item.read"]
-      }
-    ]
-  }
-}
-```
+Capability-bearing action execution is controlled by installed extension routes and continuation grants:
 
-`capabilities.json` is local grant policy. If you create it manually, keep it private with `chmod 600 "$SPINDLE_STATE_DIR/capabilities.json"`.
+- Route declarations installed from trusted extension packages may grant capabilities to their target actions.
+- Direct invokes do not carry capability grants. A direct invoke can run only actions that require no capabilities.
+- Continuation invokes reuse the core-validated capabilities from the original route/action invocation and fail closed when invalid, expired, or under-capable.
 
-Validate policy shape and route references against installed extensions before daemon startup:
+`bootstrap` removes stale legacy `capabilities.json` files. No policy file is required for normal desktop bootstrap.
 
-```bash
-cargo run -p spindle -- policy validate
-```
+## Direct action invocation
 
-Route grant entries must be objects with `source`, `event`, and `capabilities`. Legacy string-only capability lists are rejected:
-
-```json
-{
-  "routes": {
-    "workspace-indicator": [
-      "aerospace.state.read"
-    ]
-  }
-}
-```
-
-Migrate that shape to:
-
-```json
-{
-  "routes": {
-    "workspace-indicator": [
-      {
-        "source": "aerospace",
-        "event": "aerospace.workspace.changed",
-        "capabilities": ["aerospace.state.read"]
-      }
-    ]
-  }
-}
-```
-
-Extension install and `policy validate` also check that route `event` values and policy grant `source`/`event` pairs match installed extension surfaces.
-
-Example direct action invocation:
+Direct invocation is useful for no-capability actions.
 
 ```bash
 cargo run -p spindle -- invoke \
-  --action local-tool.item.write \
+  --action local-tool.item.refresh \
   --source launcher \
-  --capability local-tool.item.write \
   --args '{"name":"dev"}'
 ```
 
-`emit` is also a dispatch entrypoint, so only event kinds allowed by `capabilities.json` under `emits[source]` are accepted.
-
-A policy grantor cannot be `*`. Capability values may be `*`, but this broadens access and should be limited to trusted sources/extensions.
-
-`source` and extension IDs are local logical names, not OS sandboxes. `spindle` is a trusted same-user local automation bus bounded by private state directories, Unix socket permissions, and policy. Peer UID checks are not implemented yet. Keep the socket and state directory private, and connect only trusted same-user clients/extensions.
+If the target action declares required capabilities, direct invoke fails with a missing capability error. Wire capability-requiring actions through installed routes or continuations instead.
 
 ## State files
 
@@ -169,7 +108,6 @@ The state directory mainly contains these files:
 - `events.jsonl` — append-only event log
 - `extensions.json` — installed extensions
 - `extensions/{id}/` — staged extension packages (`extension.json`, `bin/...`)
-- `capabilities.json` — emit / direct / route grant policy
 - `spindle.sock` — daemon Unix socket
 
 The default state directory is `$SPINDLE_STATE_DIR` when set, otherwise `$HOME/.local/state/spindle`.

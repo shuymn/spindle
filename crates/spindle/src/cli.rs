@@ -1,7 +1,7 @@
 use std::{
-    env,
+    env, fs,
     io::{self, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
@@ -9,9 +9,10 @@ use clap::{Args, Parser, Subcommand};
 use serde_json::Value;
 
 use crate::{
-    CapabilityPolicy, EventFilter, EventLog, ExtensionManifest, ExtensionRegistry,
-    ExtensionRuntimeHost, HubRequest, SpindleError, execute_request, send_request, serve,
-    validate_installed_registry, validate_json_object,
+    EventFilter, EventLog, ExtensionManifest, ExtensionRegistry, ExtensionRuntimeHost, HubRequest,
+    SpindleError, execute_request, extension::MANIFEST_FILE, send_request, serve,
+    server::prepare_socket, store::ensure_private_parent, validate_installed_registry,
+    validate_json_object,
 };
 
 /// Run the spindle command-line interface.
@@ -42,6 +43,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Prepare state before running the local spindle daemon.
+    Bootstrap(BootstrapArgs),
     /// Run the local spindle daemon.
     Daemon(ServeArgs),
     /// Serve JSONL hub requests over a Unix domain socket.
@@ -58,12 +61,23 @@ enum Command {
     Invoke(InvokeArgs),
     /// Work with extension manifests.
     Extension(ExtensionCommand),
-    /// Work with capability policy.
-    Policy(PolicyCommand),
 }
 
 #[derive(Debug, Args)]
 struct ServeArgs {
+    #[arg(long, value_name = "SOCKET")]
+    socket: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct BootstrapArgs {
+    #[arg(
+        long,
+        help = "execute extension entrypoints during bootstrap to discover dynamic registration surface"
+    )]
+    trust_runtime: bool,
+    #[arg(long, value_name = "DIR")]
+    extension_dir: Vec<PathBuf>,
     #[arg(long, value_name = "SOCKET")]
     socket: Option<PathBuf>,
 }
@@ -78,7 +92,10 @@ struct SendArgs {
 
 #[derive(Debug, Args)]
 struct InstallArgs {
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "execute the extension entrypoint during install to discover dynamic registration surface"
+    )]
     trust_runtime: bool,
     #[arg(value_name = "PACKAGE")]
     package: PathBuf,
@@ -102,8 +119,6 @@ struct InvokeArgs {
     action: String,
     #[arg(long, value_name = "SOURCE")]
     source: String,
-    #[arg(long = "capability", value_name = "CAPABILITY")]
-    capabilities: Vec<String>,
     #[arg(long, value_name = "JSON", default_value = "{}")]
     args: String,
 }
@@ -136,18 +151,6 @@ struct ExtensionCommand {
     command: ExtensionSubcommand,
 }
 
-#[derive(Debug, Args)]
-struct PolicyCommand {
-    #[command(subcommand)]
-    command: PolicySubcommand,
-}
-
-#[derive(Debug, Subcommand)]
-enum PolicySubcommand {
-    /// Validate capability policy against installed extensions.
-    Validate,
-}
-
 #[derive(Debug, Subcommand)]
 enum ExtensionSubcommand {
     /// Validate a JSON extension manifest.
@@ -166,7 +169,10 @@ struct ValidateExtensionArgs {
 
 #[derive(Debug, Args)]
 struct SurfaceExtensionArgs {
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "execute the extension entrypoint to inspect dynamic registration surface without installing"
+    )]
     trust_runtime: bool,
     #[arg(value_name = "MANIFEST")]
     manifest: PathBuf,
@@ -179,18 +185,16 @@ fn run_cli(cli: Cli) -> Result<()> {
     let runtime = ExtensionRuntimeHost::new();
 
     match cli.command {
+        Command::Bootstrap(args) => {
+            bootstrap_state(&state_dir, args, &registry, &runtime)?;
+        }
         Command::Daemon(args) | Command::Serve(args) => {
             let socket = resolve_socket_path(&state_dir, args.socket);
             serve(&socket, &log)?;
         }
         Command::Install(args) => {
-            let registered = if args.trust_runtime {
-                registry.install_manifest_with_runtime(&args.package, &runtime)?
-            } else {
-                let registered = registry.install_manifest(&args.package)?;
-                runtime.invalidate_extension(&registered.id);
-                registered
-            };
+            let registered =
+                install_extension_package(&registry, &runtime, &args.package, args.trust_runtime)?;
             write_json(&registered)?;
         }
         Command::Send(args) => {
@@ -233,7 +237,6 @@ fn run_cli(cli: Cli) -> Result<()> {
                 HubRequest::Invoke {
                     action: args.action,
                     source: args.source,
-                    capabilities: args.capabilities,
                     args: action_args,
                 },
                 &log,
@@ -267,15 +270,85 @@ fn run_cli(cli: Cli) -> Result<()> {
             let extensions = registry.list()?;
             write_json(&extensions)?;
         }
-        Command::Policy(PolicyCommand {
-            command: PolicySubcommand::Validate,
-        }) => {
-            validate_installed_registry(&registry)?;
-            let policy = CapabilityPolicy::load(&state_dir)?;
-            write_json(&policy)?;
-        }
     }
 
+    Ok(())
+}
+
+fn bootstrap_state(
+    state_dir: &Path,
+    args: BootstrapArgs,
+    registry: &ExtensionRegistry,
+    runtime: &ExtensionRuntimeHost,
+) -> Result<()> {
+    ensure_private_parent(
+        &state_dir.join(".bootstrap"),
+        "state_dir",
+        "state directory must be private",
+    )?;
+
+    remove_legacy_policy_file(state_dir)?;
+
+    for package in extension_packages(&args.extension_dir)? {
+        install_extension_package(registry, runtime, &package, args.trust_runtime)?;
+    }
+
+    let socket = resolve_socket_path(state_dir, args.socket);
+    prepare_socket(&socket)?;
+    validate_installed_registry(registry)?;
+    Ok(())
+}
+
+fn install_extension_package(
+    registry: &ExtensionRegistry,
+    runtime: &ExtensionRuntimeHost,
+    package: &Path,
+    trust_runtime: bool,
+) -> Result<crate::RegisteredExtension, SpindleError> {
+    if trust_runtime {
+        registry.install_manifest_with_runtime(package, runtime)
+    } else {
+        let registered = registry.install_manifest(package)?;
+        runtime.invalidate_extension(&registered.id);
+        Ok(registered)
+    }
+}
+
+fn extension_packages(inputs: &[PathBuf]) -> Result<Vec<PathBuf>, SpindleError> {
+    let mut packages = Vec::new();
+    for input in inputs {
+        if is_extension_package(input) {
+            packages.push(input.clone());
+            continue;
+        }
+        if !input.is_dir() {
+            return Err(SpindleError::InvalidField {
+                field: "extension-dir",
+                reason: "path must be a package directory or directory containing packages",
+            });
+        }
+        let mut children = fs::read_dir(input)?.try_fold(Vec::new(), |mut packages, entry| {
+            let path = entry?.path();
+            if is_extension_package(&path) {
+                packages.push(path);
+            }
+            Ok::<_, std::io::Error>(packages)
+        })?;
+        children.sort();
+        packages.extend(children);
+    }
+    Ok(packages)
+}
+
+fn is_extension_package(path: &Path) -> bool {
+    path.join(MANIFEST_FILE).is_file()
+}
+
+fn remove_legacy_policy_file(state_dir: &Path) -> Result<(), SpindleError> {
+    let path = state_dir.join("capabilities.json");
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
     Ok(())
 }
 
@@ -419,7 +492,6 @@ mod tests {
             command: Command::Invoke(InvokeArgs {
                 action: String::from("test.render"),
                 source: String::from("test"),
-                capabilities: Vec::new(),
                 args: String::from("[]"),
             }),
         });
@@ -429,64 +501,101 @@ mod tests {
     }
 
     #[test]
-    fn policy_validate_cli_succeeds_for_installed_extensions() -> Result<()> {
+    fn bootstrap_removes_stale_legacy_capabilities_json() -> Result<()> {
         let dir = crate::store::tests_support::test_dir()?;
-        fs::create_dir_all(&dir)?;
-        let workflow_package = dir.join("workflow");
-        let provider_package = dir.join("provider");
-        fs::create_dir_all(&workflow_package)?;
-        fs::create_dir_all(provider_package.join("bin"))?;
+        let source_dir = crate::store::tests_support::test_dir()?;
+        let packages = source_dir.join("packages");
+        fs::create_dir_all(&packages)?;
         fs::write(
-            workflow_package.join("extension.json"),
-            r#"{
-          "id": "workflow",
-          "version": "0.1.0",
-          "runtime": "recipe",
-          "routes": [
-            {
-              "event": "provider.changed",
-              "source": "provider",
-              "action": "provider.snapshot",
-              "capabilities": ["provider.read"]
-            }
-          ]
-        }"#,
+            dir.join("capabilities.json"),
+            r#"{"emits":{},"direct":{},"routes":{"legacy":[]}}"#,
         )?;
-        crate::store::tests_support::write_executable(
-            &provider_package.join("bin/provider"),
-            "#!/bin/sh\nexit 0\n",
-        )?;
-        fs::write(
-            provider_package.join("extension.json"),
-            r#"{
-          "id": "provider",
-          "version": "0.1.0",
-          "runtime": "stdio-jsonl",
-          "emits": ["provider.changed"],
-          "actions": {
-            "provider.snapshot": {
-              "capabilities": []
-            }
-          }
-        }"#,
-        )?;
-        crate::store::tests_support::write_capability_policy(
-            &dir,
-            r#"{"emits":{"provider":["provider.changed"]},"direct":{},"routes":{"workflow":[{"source":"provider","event":"provider.changed","capabilities":["provider.read"]}]}}"#,
-        )?;
-
-        let registry = ExtensionRegistry::in_dir(&dir);
-        registry.install_manifest(&provider_package)?;
-        registry.install_manifest(&workflow_package)?;
 
         run_cli(Cli {
             state_dir: Some(dir.clone()),
-            command: Command::Policy(PolicyCommand {
-                command: PolicySubcommand::Validate,
+            command: Command::Bootstrap(BootstrapArgs {
+                trust_runtime: false,
+                extension_dir: vec![packages],
+                socket: None,
             }),
         })?;
 
+        assert!(!dir.join("capabilities.json").exists());
         fs::remove_dir_all(dir)?;
+        fs::remove_dir_all(source_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn bootstrap_rejects_custom_socket_with_public_parent() -> Result<()> {
+        let dir = crate::store::tests_support::test_dir()?;
+        let socket_dir = crate::store::tests_support::test_dir()?;
+        fs::create_dir_all(&socket_dir)?;
+        fs::set_permissions(&socket_dir, fs::Permissions::from_mode(0o755))?;
+
+        let result = run_cli(Cli {
+            state_dir: Some(dir.clone()),
+            command: Command::Bootstrap(BootstrapArgs {
+                trust_runtime: false,
+                extension_dir: Vec::new(),
+                socket: Some(socket_dir.join("spindle.sock")),
+            }),
+        });
+
+        assert!(matches!(
+            result,
+            Err(error) if error.downcast_ref::<SpindleError>().is_some_and(|error| {
+                matches!(
+                    error,
+                    SpindleError::InvalidField {
+                        field: "socket",
+                        ..
+                    }
+                )
+            })
+        ));
+        fs::set_permissions(&socket_dir, fs::Permissions::from_mode(0o700))?;
+        fs::remove_dir_all(dir)?;
+        fs::remove_dir_all(socket_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn bootstrap_fails_for_incomplete_extension_set() -> Result<()> {
+        let dir = crate::store::tests_support::test_dir()?;
+        let source_dir = crate::store::tests_support::test_dir()?;
+        let packages = source_dir.join("packages");
+        let workflow = packages.join("workflow");
+        fs::create_dir_all(&workflow)?;
+        fs::write(
+            workflow.join("extension.json"),
+            r#"{
+              "id": "workflow",
+              "version": "0.1.0",
+              "runtime": "recipe",
+              "routes": [
+                {
+                  "event": "provider.changed",
+                  "source": "provider",
+                  "action": "provider.snapshot",
+                  "capabilities": ["provider.read"]
+                }
+              ]
+            }"#,
+        )?;
+        let result = run_cli(Cli {
+            state_dir: Some(dir.clone()),
+            command: Command::Bootstrap(BootstrapArgs {
+                trust_runtime: false,
+                extension_dir: vec![packages],
+                socket: None,
+            }),
+        });
+
+        assert!(result.is_err());
+        assert!(dir.join("extensions.json").exists());
+        fs::remove_dir_all(dir)?;
+        fs::remove_dir_all(source_dir)?;
         Ok(())
     }
 }

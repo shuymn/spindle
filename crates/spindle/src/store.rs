@@ -425,14 +425,6 @@ pub mod tests_support {
         Ok(())
     }
 
-    pub fn write_capability_policy(
-        state_dir: &std::path::Path,
-        contents: &str,
-    ) -> Result<(), SpindleError> {
-        fs::write(state_dir.join("capabilities.json"), contents)?;
-        Ok(())
-    }
-
     /// Copy the `spindle-test-host` binary into `dir` and write its JSON config.
     ///
     /// The returned path is suitable for use as a stdio JSONL manifest entrypoint.

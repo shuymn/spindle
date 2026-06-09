@@ -35,9 +35,7 @@ pub use extension::{
     RegisteredExtension, RegisteredRuntimeTrust,
 };
 pub use handler::{execute_request, execute_request_with_continuations};
-pub use policy::{
-    CapabilityPolicy, RouteGrantPolicy, validate_extension_routes, validate_installed_registry,
-};
+pub use policy::{validate_extension_routes, validate_installed_registry, validate_registry};
 pub use protocol::{HubRequest, HubResponse};
 pub use runtime::ExtensionRuntimeHost;
 pub use server::{send_request, send_request_with_timeout, serve};
@@ -80,26 +78,6 @@ pub enum SpindleError {
         new_extension: String,
     },
 
-    /// A client or route attempted to grant an unauthorized capability.
-    #[error("{grant_kind} {grantor} is not allowed to grant capability {capability}")]
-    CapabilityGrantDenied {
-        /// Grant kind.
-        grant_kind: &'static str,
-        /// Client source or extension id trying to grant a capability.
-        grantor: String,
-        /// Capability being granted.
-        capability: String,
-    },
-
-    /// A direct client attempted to emit an unauthorized event.
-    #[error("source {event_source} is not allowed to emit event {kind}")]
-    EventEmitDenied {
-        /// Event source.
-        event_source: String,
-        /// Event kind.
-        kind: String,
-    },
-
     /// A route references an event kind that no installed extension owns.
     #[error("extension {extension} route references unknown event {event}")]
     UnknownRouteEvent {
@@ -125,55 +103,6 @@ pub enum SpindleError {
         extension: String,
         /// Unknown action name.
         action: String,
-    },
-
-    /// A route grant policy references an unknown route-owning extension.
-    #[error("capabilities.json routes grantor {grantor} is not an installed extension")]
-    UnknownPolicyGrantor {
-        /// Route grant policy grantor.
-        grantor: String,
-    },
-
-    /// A route grant policy references an unknown event source extension.
-    #[error(
-        "capabilities.json routes[{grantor}] references unknown source extension {grant_source}"
-    )]
-    UnknownPolicyGrantSource {
-        /// Route grant policy grantor.
-        grantor: String,
-        /// Unknown source extension identifier.
-        grant_source: String,
-    },
-
-    /// A route grant policy references an unknown event kind.
-    #[error("capabilities.json routes[{grantor}] references unknown event {event}")]
-    UnknownPolicyGrantEvent {
-        /// Route grant policy grantor.
-        grantor: String,
-        /// Unknown event kind.
-        event: String,
-    },
-
-    /// A route grant policy does not match any route owned by the grantor extension.
-    #[error(
-        "capabilities.json routes[{grantor}] has no matching route for source {grant_source} and event {event}"
-    )]
-    OrphanPolicyGrant {
-        /// Route grant policy grantor.
-        grantor: String,
-        /// Event source in the grant policy.
-        grant_source: String,
-        /// Event kind in the grant policy.
-        event: String,
-    },
-
-    /// A legacy route grant policy shape was used instead of route grant objects.
-    #[error(
-        "capabilities.json routes[{grantor}] must be an array of objects with source, event, and capabilities fields; legacy capability string lists are not supported"
-    )]
-    LegacyRouteGrantPolicy {
-        /// Route grant policy grantor.
-        grantor: String,
     },
 
     /// An extension action produced an undeclared event kind.

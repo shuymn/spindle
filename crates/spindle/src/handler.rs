@@ -3,15 +3,15 @@ use serde_json::Value;
 use crate::{
     ActionRequest, ContinuationAudit, ContinuationConfig, Dispatcher, Event, EventFilter, EventLog,
     ExtensionManifest, ExtensionRegistry, ExtensionRuntimeHost, HubRequest, SpindleError,
-    dispatch::ensure_produced_event, policy::CapabilityPolicy,
+    dispatch::ensure_produced_event,
 };
 
 /// Execute one hub request against local kernel state.
 ///
 /// # Errors
 ///
-/// Returns an error if validation, policy checks, I/O, extension dispatch, or
-/// JSON serialization fails.
+/// Returns an error if validation, I/O, extension dispatch, or JSON
+/// serialization fails.
 pub fn execute_request(
     request: HubRequest,
     log: &EventLog,
@@ -25,8 +25,8 @@ pub fn execute_request(
 ///
 /// # Errors
 ///
-/// Returns an error if validation, policy checks, I/O, extension dispatch, or
-/// JSON serialization fails.
+/// Returns an error if validation, I/O, extension dispatch, or JSON
+/// serialization fails.
 pub fn execute_request_with_continuations(
     request: HubRequest,
     log: &EventLog,
@@ -55,9 +55,8 @@ pub fn execute_request_with_continuations(
         HubRequest::Invoke {
             action,
             source,
-            capabilities,
             args,
-        } => invoke_action(&action, source, capabilities, &args, &state),
+        } => invoke_action(&action, source, &args, &state),
         HubRequest::ContinuationInvoke {
             continuation,
             action,
@@ -104,8 +103,6 @@ fn emit_event(
     data: Value,
     state: &HandlerState<'_>,
 ) -> Result<Value, SpindleError> {
-    let policy = CapabilityPolicy::load(state_dir_for_log(state.log))?;
-    policy.ensure_emit(&source, &kind)?;
     let event = Event::builder(kind, source)
         .subject(subject)
         .data(data)
@@ -145,19 +142,15 @@ fn query_events(
 fn invoke_action(
     action: &str,
     source: String,
-    capabilities: Vec<String>,
     args: &Value,
     state: &HandlerState<'_>,
 ) -> Result<Value, SpindleError> {
-    let policy = CapabilityPolicy::load(state_dir_for_log(state.log))?;
-    policy.ensure_direct_grants(&source, &capabilities)?;
-    let granted_capabilities = capabilities.clone();
     record_and_dispatch_action_request(
         ActionDispatchRequest {
             action,
             requested_by: source,
-            capabilities,
-            dispatch_capabilities: &granted_capabilities,
+            capabilities: Vec::new(),
+            dispatch_capabilities: &[],
             args,
             continuation_audit: None,
             continuation: state.continuation,
@@ -237,8 +230,6 @@ fn continuation_emit(
         return Err(SpindleError::ContinuationInvalid);
     };
     let grant = continuation.store.validate(continuation_id)?;
-    let policy = CapabilityPolicy::load(state_dir_for_log(state.log))?;
-    policy.ensure_emit(&grant.extension, &kind)?;
     ensure_continuation_emit_allowed(state.registry, &grant.extension, &kind)?;
     let event = Event::builder(kind, grant.extension)
         .subject(subject)
@@ -260,14 +251,9 @@ fn ensure_continuation_emit_allowed(
     ensure_produced_event(&extension, "continuation.emit", kind)
 }
 
-fn state_dir_for_log(log: &EventLog) -> &std::path::Path {
-    log.state_dir()
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::BTreeMap,
         fs,
         os::unix::fs::PermissionsExt,
         path::{Path, PathBuf},
@@ -280,59 +266,6 @@ mod tests {
 
     use super::*;
     use crate::{ContinuationGrantRequest, ContinuationStore};
-
-    fn write_capability_policy(
-        dir: &std::path::Path,
-        emits: &[(&str, &[&str])],
-        direct: &[(&str, &[&str])],
-        routes: &[(&str, &str, &str, &[&str])],
-    ) -> Result<(), SpindleError> {
-        fs::create_dir_all(dir)?;
-        let emits = emits
-            .iter()
-            .map(|(grantor, events)| {
-                (
-                    String::from(*grantor),
-                    events
-                        .iter()
-                        .map(|event| String::from(*event))
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        let direct = direct
-            .iter()
-            .map(|(grantor, capabilities)| {
-                (
-                    String::from(*grantor),
-                    capabilities
-                        .iter()
-                        .map(|capability| String::from(*capability))
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        let mut routes_by_grantor = BTreeMap::<String, Vec<serde_json::Value>>::new();
-        for (grantor, source, event, capabilities) in routes {
-            routes_by_grantor
-                .entry(String::from(*grantor))
-                .or_default()
-                .push(json!({
-                    "source": source,
-                    "event": event,
-                    "capabilities": capabilities
-                }));
-        }
-        fs::write(
-            dir.join("capabilities.json"),
-            serde_json::to_string_pretty(&json!({
-                "emits": emits,
-                "direct": direct,
-                "routes": routes_by_grantor
-            }))?,
-        )?;
-        Ok(())
-    }
 
     fn prepare_stdio_install_package(
         dir: &Path,
@@ -373,12 +306,11 @@ mod tests {
     }
 
     #[test]
-    fn execute_emit_appends_event() -> Result<(), SpindleError> {
+    fn execute_emit_appends_event_without_policy() -> Result<(), SpindleError> {
         let dir = crate::store::tests_support::test_dir()?;
         let log = EventLog::in_dir(&dir);
         let registry = ExtensionRegistry::in_dir(&dir);
         let runtime = ExtensionRuntimeHost::new();
-        write_capability_policy(&dir, &[("codex-hook", &["agent.status.changed"])], &[], &[])?;
 
         let response = execute_request(
             HubRequest::Emit {
@@ -426,12 +358,6 @@ mod tests {
         let log = EventLog::in_dir(&dir);
         let registry = ExtensionRegistry::in_dir(&dir);
         let runtime = ExtensionRuntimeHost::new();
-        write_capability_policy(
-            &dir,
-            &[("test", &["test.changed"])],
-            &[],
-            &[("test-recipe", "test", "test.changed", &["test.write"])],
-        )?;
         registry.install_manifest_with_runtime(&adapter_package, &runtime)?;
         registry.install_manifest(&recipe_package)?;
 
@@ -454,7 +380,8 @@ mod tests {
     }
 
     #[test]
-    fn execute_invoke_requires_policy_for_granted_capabilities() -> Result<(), SpindleError> {
+    fn direct_invoke_rejects_capability_requiring_action_without_continuation()
+    -> Result<(), SpindleError> {
         let dir = crate::store::tests_support::test_dir()?;
         fs::create_dir_all(&dir)?;
         let host =
@@ -469,7 +396,6 @@ mod tests {
             HubRequest::Invoke {
                 action: String::from("test.render"),
                 source: String::from("unit"),
-                capabilities: vec![String::from("test.write")],
                 args: json!({}),
             },
             &log,
@@ -479,23 +405,8 @@ mod tests {
 
         assert!(matches!(
             denied,
-            Err(SpindleError::CapabilityGrantDenied { .. })
+            Err(SpindleError::MissingActionCapability { .. })
         ));
-
-        write_capability_policy(&dir, &[], &[("unit", &["test.write"])], &[])?;
-        let response = execute_request(
-            HubRequest::Invoke {
-                action: String::from("test.render"),
-                source: String::from("unit"),
-                capabilities: vec![String::from("test.write")],
-                args: json!({}),
-            },
-            &log,
-            &registry,
-            &runtime,
-        )?;
-
-        assert_eq!(response["dispatches"][0]["action"], "test.render");
         fs::remove_dir_all(dir)?;
         Ok(())
     }

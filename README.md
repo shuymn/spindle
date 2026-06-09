@@ -52,17 +52,6 @@ export SPINDLE_STATE_DIR=/tmp/spindle
 mkdir -p "$SPINDLE_STATE_DIR"
 chmod 700 "$SPINDLE_STATE_DIR"
 
-cat > "$SPINDLE_STATE_DIR/capabilities.json" <<'JSON'
-{
-  "emits": {
-    "pi": ["agent.status.changed"]
-  },
-  "direct": {},
-  "routes": {}
-}
-JSON
-chmod 600 "$SPINDLE_STATE_DIR/capabilities.json"
-
 cargo run -p spindle -- emit \
   --type agent.status.changed \
   --source pi \
@@ -71,10 +60,14 @@ cargo run -p spindle -- emit \
 cargo run -p spindle -- query events --type agent.status.changed
 ```
 
+## Security model
+
+Installing an extension package means trusting its executable code to run as your user. Local clients that can access the user's spindle socket may emit events; event `source` is a routing label, not an authentication boundary. Manifest route `source` values are still validated against installed event-owning extensions. Capability-bearing action execution is authorized by installed route declarations and continuation grants, not by a separate policy file.
+
 ## Documentation
 
 - [Concepts](docs/concepts.md) — kernel responsibilities, extension boundaries, and what stays out of core
-- [Usage](docs/usage.md) — setup, CLI examples, capability policy, and state files
+- [Usage](docs/usage.md) — setup, CLI examples, trusted local automation model, and state files
 - [Extensions](docs/extensions.md) — manifests, registration surface, routes, continuations, and stdio JSONL hosts
 - [Extension SDK README](crates/spindle-extension-sdk/README.md) — SDK package notes
 

@@ -19,8 +19,8 @@ use super::{
     surface::ensure_surface_ownership,
 };
 use crate::{
-    CapabilityPolicy, ExtensionRuntimeHost, SpindleError, lock::SidecarLock,
-    runtime::resolve_package_binary, store::ensure_private_state_parent,
+    ExtensionRuntimeHost, SpindleError, lock::SidecarLock, runtime::resolve_package_binary,
+    store::ensure_private_state_parent,
 };
 
 /// Registered extension metadata stored by the spindle kernel.
@@ -115,9 +115,6 @@ impl ExtensionRegistry {
             staged.package_root.clone(),
             runtime_trust,
         );
-        let policy = CapabilityPolicy::load(self.state_dir())?;
-        policy.ensure_route_grants(&registered)?;
-
         ensure_private_state_parent(&self.path)?;
         let _lock = SidecarLock::acquire(&self.path)?;
         let mut entries = self.list()?;

@@ -2,6 +2,8 @@
 
 ## Installing extensions
 
+Install only extension packages you trust to run as your user. Installing a package is the trust act: `spindle` does not sandbox extension executables. Installed route declarations can grant capabilities to their target actions without a separate cross-extension policy artifact.
+
 Install an extension package by passing a package directory. `install` stages the package into `$SPINDLE_STATE_DIR/extensions/{id}/` and records the staged entrypoint SHA-256 in the registry.
 
 ```bash
@@ -16,11 +18,11 @@ Validate a manifest without staging or starting the extension host.
 cargo run -p spindle -- extension validate /path/to/my-extension/extension.json
 ```
 
-Install all required extensions in any order. Cross-extension route completeness is validated at daemon startup and by `spindle policy validate`, not during individual installs.
+Install all required extensions in any order. Cross-extension route completeness is validated at daemon startup and bootstrap, not during individual installs.
 
 `extension validate` reads only the static manifest and does not run the entrypoint. `install` stages the package and records static manifest surface by default.
 
-For a `stdio-jsonl` extension, pass `--trust-runtime` when you want to start the entrypoint and receive dynamic surface from the `register` request. `--trust-runtime` executes the source entrypoint for dynamic surface discovery, then stages the package and records the staged entrypoint path / SHA-256 in the registry. To inspect dynamic surface without writing the registry, use `extension surface --trust-runtime <manifest>`.
+For a `stdio-jsonl` extension, pass `--trust-runtime` when you want to start the entrypoint and receive dynamic surface from the `register` request. `--trust-runtime` executes the source entrypoint for dynamic surface discovery, then stages the package and records the staged entrypoint path / SHA-256 in the registry. The flag does not make an untrusted package safe; it only opts into install-time execution for registration. To inspect dynamic surface without writing the registry, use `extension surface --trust-runtime <manifest>`.
 
 ## Manifest and registration surface
 
@@ -49,7 +51,7 @@ Event/action/capability surface can be written statically in the manifest, but `
 
 `emits` are event kinds an extension may observe from external input or IPC and emit. `produces` are event kinds an extension action may return in `ActionOutput`. Both are treated as event surface ownership, so two extensions cannot register the same event kind through either `emits` or `produces`.
 
-Top-level `capabilities` declare capabilities an extension **provides** and owns. Action `capabilities` declare capabilities an action **requires** at invoke time. Required capabilities may come from routes, direct invokes, or continuations; they do not need to appear in the provider extension's top-level `capabilities` list. Consumer extensions can require provider capabilities in action metadata without claiming ownership of those capabilities.
+Top-level `capabilities` declare capabilities an extension **provides** and owns. Action `capabilities` declare capabilities an action **requires** at invoke time. Required capabilities may come from installed routes or continuations; direct invokes do not grant capabilities. Required capabilities do not need to appear in the provider extension's top-level `capabilities` list. Consumer extensions can require provider capabilities in action metadata without claiming ownership of those capabilities.
 
 ```rust
 ExtensionRegistration::new()
@@ -62,7 +64,7 @@ ExtensionRegistration::new()
     )
 ```
 
-Routes are small connections from events to actions. A route that grants capabilities must specify `source`. During dispatch, the event payload and the route's static `args` are merged as objects. If a key exists in both, route `args` wins.
+Routes are small connections from events to actions. Event `source` values emitted by local clients are routing labels, but a manifest route `source`, when present, must name an installed extension that owns the route `event` through `emits` or `produces`. A route that grants capabilities must specify `source`. Installed trusted routes may grant the target action's required capabilities directly; no external route grant allowlist is required. During dispatch, the event payload and the route's static `args` are merged as objects. If a key exists in both, route `args` wins.
 
 ```json
 {
@@ -76,7 +78,7 @@ Routes are small connections from events to actions. A route that grants capabil
 
 ## Asynchronous continuations
 
-When the daemon invokes an extension action through a route or direct invocation, it passes a short-lived `ContinuationContext` in `ActionContext`. The extension can return an action response immediately, then use this handle to send `continuation-invoke` / `continuation-emit` to the daemon socket.
+When the daemon invokes an extension action through a route or a no-capability direct invocation, it passes a short-lived `ContinuationContext` in `ActionContext`. The extension can return an action response immediately, then use this handle to send `continuation-invoke` / `continuation-emit` to the daemon socket.
 
 Continuations are limited to the original invocation's capability grant. The core validates handle identity, origin extension, expiry, and required capability. Invalid, expired, or under-capable continuation work fails closed. Continuation-backed invokes record continuation provenance in the `action.requested` event.
 

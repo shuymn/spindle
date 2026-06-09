@@ -24,7 +24,7 @@ ui.item.clicked
   -> provider.item.focus
 ```
 
-Provider extensions handle external protocols. Workflow extensions own projection logic, debounce policies, and branching. The kernel validates registered surface and capability policy, then dispatches events to actions.
+Provider extensions handle external protocols. Workflow extensions own projection logic, debounce policies, and branching. The kernel validates registered surface, then dispatches events to actions.
 
 ## Kernel responsibilities
 
@@ -35,7 +35,8 @@ Provider extensions handle external protocols. Workflow extensions own projectio
 - Extension manifest validation
 - Registration, startup, and reuse of stdio JSONL extension hosts
 - Ownership checks for extension-declared event/action surfaces and provided capabilities
-- Direct invoke and route grant control through capability policy
+- Direct invoke without capability minting
+- Installed route capability grants from trusted extension declarations
 - Capability-scoped continuation handles for deferred extension work
 - Recursive dispatch of action output events, with a depth limit
 

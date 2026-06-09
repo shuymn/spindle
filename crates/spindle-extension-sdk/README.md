@@ -18,10 +18,11 @@ extension: event types, installed actions, and capabilities. This lets workflow
 extensions adapt to registered providers instead of linking directly to provider
 implementations.
 
-Action and route capabilities are enforced by spindle during dispatch. Direct
-invocations must grant the target action's required capabilities, and routes can
-grant capabilities with `RegistrationRoute::capability(...)`. A route that
-grants capabilities must also set `RegistrationRoute::source(...)`.
+Action and route capabilities are enforced by spindle during dispatch. Installed
+trusted routes can grant capabilities with `RegistrationRoute::capability(...)`
+without a separate policy artifact. Direct invocations do not grant capabilities,
+so capability-requiring actions should be reached through routes or continuations.
+A route that grants capabilities must also set `RegistrationRoute::source(...)`.
 
 Routes are the event handler contract. The SDK intentionally has no
 `subscriptions` list: an extension handles an event by registering a handler
